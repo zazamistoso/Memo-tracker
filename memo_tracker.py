@@ -5,6 +5,7 @@ import os
 from datetime import datetime
 from tkinter import messagebox, filedialog
 import tkinter as tk
+from tkcalendar import Calendar
 
 # ── App Config ───────────────────────────────────────────────────────────────
 ctk.set_appearance_mode("light")
@@ -425,6 +426,67 @@ class EditOutgoingPopup(ctk.CTkToplevel):
             self.destroy()
 
 
+
+# ── Date Picker Popup ─────────────────────────────────────────────────────────
+class DatePickerPopup(ctk.CTkToplevel):
+    """Small calendar popup. Calls on_select(date_str) on confirmation."""
+    def __init__(self, parent, current_date, on_select):
+        super().__init__(parent)
+        self._on_select = on_select
+        self.title("Pick a Date")
+        self.resizable(False, False)
+        self.grab_set()
+        self.configure(fg_color=SURFACE)
+
+        # Parse current date if set, else use today
+        try:
+            dt = datetime.strptime(current_date.strip(), "%Y-%m-%d")
+        except Exception:
+            dt = datetime.today()
+
+        ctk.CTkFrame(self, fg_color=ACCENT, corner_radius=0, height=6
+                     ).pack(fill="x")
+
+        self._cal = Calendar(
+            self,
+            selectmode="day",
+            year=dt.year, month=dt.month, day=dt.day,
+            date_pattern="yyyy-mm-dd",
+            background=ACCENT,
+            foreground="#FFFFFF",
+            headersbackground=ACCENT_DARK,
+            headersforeground="#FFFFFF",
+            selectbackground="#2E86C1",
+            selectforeground="#FFFFFF",
+            normalbackground=CARD,
+            normalforeground=TEXT_MAIN,
+            weekendbackground=ROW_ALT,
+            weekendforeground=TEXT_MAIN,
+            othermonthbackground=SURFACE,
+            othermonthforeground=TEXT_SUB,
+            bordercolor=BORDER,
+            font=("Helvetica", 10),
+        )
+        self._cal.pack(padx=16, pady=(12, 8))
+
+        btn_row = ctk.CTkFrame(self, fg_color=SURFACE, corner_radius=0)
+        btn_row.pack(fill="x", padx=16, pady=(0, 14))
+        make_button(btn_row, "  ✔  Select", self._confirm,
+                    ACCENT, ACCENT_DARK, height=34, width=120, radius=6
+                    ).pack(side="left")
+        make_button(btn_row, "Clear Date", self._clear,
+                    BORDER, "#BFC9CA", text_color=TEXT_MAIN,
+                    height=34, width=100, radius=6
+                    ).pack(side="left", padx=(8, 0))
+
+    def _confirm(self):
+        self._on_select(self._cal.get_date())
+        self.destroy()
+
+    def _clear(self):
+        self._on_select("")
+        self.destroy()
+
 # ── Past Entry Popup ──────────────────────────────────────────────────────────
 class PastEntryPopup(ctk.CTkToplevel):
     TITLE  = "Log Past Entry"
@@ -746,28 +808,37 @@ class BaseTab(ctk.CTkFrame):
                             border_width=1, border_color=BORDER)
         fbar.pack(fill="x", padx=24, pady=(6, 0))
 
+        # From date picker
         make_label(fbar, "From:", size=11, weight="bold",
-                   color=TEXT_SUB).pack(side="left", padx=(10, 2), pady=6)
-        self._from_var = ctk.StringVar()
-        self._from_var.trace_add("write", lambda *_: self._apply_filters())
-        ctk.CTkEntry(fbar, textvariable=self._from_var,
-                     placeholder_text="YYYY-MM-DD",
-                     fg_color=CARD, border_color=BORDER, text_color=TEXT_MAIN,
-                     font=ctk.CTkFont(size=12), width=110, height=30,
-                     corner_radius=6).pack(side="left", padx=(0, 8), pady=6)
+                   color=TEXT_SUB).pack(side="left", padx=(10, 4), pady=8)
+        self._from_var = ctk.StringVar(value="")
+        self._from_btn = ctk.CTkButton(
+            fbar, textvariable=self._from_var,
+            text="📅  Pick Date",
+            command=lambda: DatePickerPopup(self, self._from_var.get(),
+                                            self._set_from_date),
+            fg_color=ROW_ALT, hover_color=BORDER,
+            text_color=TEXT_MAIN, font=ctk.CTkFont(size=12),
+            width=120, height=30, corner_radius=6)
+        self._from_btn.pack(side="left", padx=(0, 10), pady=6)
 
+        # To date picker
         make_label(fbar, "To:", size=11, weight="bold",
-                   color=TEXT_SUB).pack(side="left", padx=(0, 2))
-        self._to_var = ctk.StringVar()
-        self._to_var.trace_add("write", lambda *_: self._apply_filters())
-        ctk.CTkEntry(fbar, textvariable=self._to_var,
-                     placeholder_text="YYYY-MM-DD",
-                     fg_color=CARD, border_color=BORDER, text_color=TEXT_MAIN,
-                     font=ctk.CTkFont(size=12), width=110, height=30,
-                     corner_radius=6).pack(side="left", padx=(0, 12), pady=6)
+                   color=TEXT_SUB).pack(side="left", padx=(0, 4))
+        self._to_var = ctk.StringVar(value="")
+        self._to_btn = ctk.CTkButton(
+            fbar, textvariable=self._to_var,
+            text="📅  Pick Date",
+            command=lambda: DatePickerPopup(self, self._to_var.get(),
+                                            self._set_to_date),
+            fg_color=ROW_ALT, hover_color=BORDER,
+            text_color=TEXT_MAIN, font=ctk.CTkFont(size=12),
+            width=120, height=30, corner_radius=6)
+        self._to_btn.pack(side="left", padx=(0, 12), pady=6)
 
+        # Department filter
         make_label(fbar, "Dept:", size=11, weight="bold",
-                   color=TEXT_SUB).pack(side="left", padx=(0, 2))
+                   color=TEXT_SUB).pack(side="left", padx=(0, 4))
         self._dept_filter_var = ctk.StringVar(value="All Departments")
         self._dept_filter_menu = ctk.CTkOptionMenu(
             fbar, variable=self._dept_filter_var,
@@ -780,9 +851,9 @@ class BaseTab(ctk.CTkFrame):
             font=ctk.CTkFont(size=12), width=200, height=30)
         self._dept_filter_menu.pack(side="left", padx=(0, 8), pady=6)
 
-        make_button(fbar, "Reset Filters", self._reset_filters,
+        make_button(fbar, "Reset", self._reset_filters,
                     BORDER, "#BFC9CA", text_color=TEXT_MAIN,
-                    height=30, width=100, radius=6
+                    height=30, width=70, radius=6
                     ).pack(side="left", padx=(0, 10), pady=6)
 
         tcard = ctk.CTkFrame(panel, fg_color=CARD, corner_radius=10,
@@ -875,10 +946,28 @@ class BaseTab(ctk.CTkFrame):
             self._page += 1
             self._refresh()
 
+    def _set_from_date(self, date_str):
+        self._from_var.set(date_str if date_str else "📅  Pick Date")
+        self._from_btn.configure(
+            text="" if date_str else "📅  Pick Date",
+            fg_color="#D5F5E3" if date_str else ROW_ALT,
+            text_color="#1E8449" if date_str else TEXT_MAIN)
+        self._filter_from = date_str
+        self._page = 0
+        self._refresh()
+
+    def _set_to_date(self, date_str):
+        self._to_var.set(date_str if date_str else "📅  Pick Date")
+        self._to_btn.configure(
+            text="" if date_str else "📅  Pick Date",
+            fg_color="#D5F5E3" if date_str else ROW_ALT,
+            text_color="#1E8449" if date_str else TEXT_MAIN)
+        self._filter_to = date_str
+        self._page = 0
+        self._refresh()
+
     def _apply_filters(self):
-        """Read filter widgets and refresh. Debounced for date fields."""
-        self._filter_from = self._from_var.get().strip()
-        self._filter_to   = self._to_var.get().strip()
+        """Called by dept dropdown change."""
         self._filter_dept = self._dept_filter_var.get()
         self._page = 0
         self._debounced_refresh()
@@ -891,6 +980,9 @@ class BaseTab(ctk.CTkFrame):
         self._filter_to   = ""
         self._filter_dept = "All Departments"
         self._page = 0
+        for btn, label in ((self._from_btn, "📅  Pick Date"),
+                           (self._to_btn,   "📅  Pick Date")):
+            btn.configure(text=label, fg_color=ROW_ALT, text_color=TEXT_MAIN)
         self._refresh()
 
     def _debounced_refresh(self):

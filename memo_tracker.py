@@ -5,7 +5,11 @@ import os
 from datetime import datetime
 from tkinter import messagebox, filedialog
 import tkinter as tk
-from tkcalendar import Calendar
+try:
+    import openpyxl
+    XLSX_SUPPORTED = True
+except ImportError:
+    XLSX_SUPPORTED = False
 
 # ── App Config ───────────────────────────────────────────────────────────────
 ctk.set_appearance_mode("light")
@@ -24,6 +28,8 @@ DANGER      = "#922B21"
 ROW_ALT     = "#EAF0F6"
 WARN_BG     = "#FEF9E7"
 WARN_BORDER = "#F9A825"
+ACTIVE_FILTER_BG = "#D5F5E3"
+ACTIVE_FILTER_FG = "#1E8449"
 
 TAB_IDLE_BG   = "#D6E4F0"
 TAB_IDLE_TEXT = ACCENT
@@ -32,9 +38,9 @@ TAB_COLORS = {
     "Incoming Memo": {"accent": "#1B4F72", "dark": "#154360", "icon": "📥"},
     "Outgoing Memo": {"accent": "#1A5276", "dark": "#154360", "icon": "📤"},
     "Departments":   {"accent": "#1D6A4A", "dark": "#155236", "icon": "🏢"},
+    "Endorsements":  {"accent": "#4A235A", "dark": "#3B1A47", "icon": "📋"},
 }
 
-# Runtime list — populated from DB on startup
 DEPARTMENTS = []
 
 
@@ -47,26 +53,27 @@ def init_db():
             id         INTEGER PRIMARY KEY AUTOINCREMENT,
             date       TEXT NOT NULL,
             department TEXT NOT NULL,
-            subject    TEXT NOT NULL,
-            receiver   TEXT NOT NULL
+            subject      TEXT NOT NULL,
+            receiver     TEXT NOT NULL
         )
     """)
+
     cur.execute("""
         CREATE TABLE IF NOT EXISTS outgoing (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
             date        TEXT NOT NULL,
             subject     TEXT NOT NULL,
             recipient   TEXT NOT NULL,
-            remarks     TEXT
+            remarks      TEXT
         )
     """)
+
     cur.execute("""
         CREATE TABLE IF NOT EXISTS departments (
             id   INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT NOT NULL UNIQUE
         )
     """)
-    # Seed default departments if table is empty
     cur.execute("SELECT COUNT(*) FROM departments")
     if cur.fetchone()[0] == 0:
         defaults = [
@@ -79,12 +86,44 @@ def init_db():
         ]
         cur.executemany("INSERT INTO departments (name) VALUES (?)",
                         [(d,) for d in defaults])
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS endorsements (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            date        TEXT NOT NULL,
+            name        TEXT NOT NULL,
+            subject     TEXT NOT NULL,
+            endorsed_to TEXT NOT NULL,
+            office      TEXT,
+            remarks     TEXT
+        )
+    """)
+    # Fix column order if office was added via ALTER TABLE (it would be last)
+    cur.execute("PRAGMA table_info(endorsements)")
+    cols = [r[1] for r in cur.fetchall()]
+    if cols and cols.index("office") != 5:
+        # Recreate with correct order, preserving data
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS endorsements_new (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                date        TEXT NOT NULL,
+                name        TEXT NOT NULL,
+                subject     TEXT NOT NULL,
+                endorsed_to TEXT NOT NULL,
+                office      TEXT,
+                remarks     TEXT
+            )
+        """)
+        cur.execute("""
+            INSERT INTO endorsements_new (id, date, name, subject, endorsed_to, office, remarks)
+            SELECT id, date, name, subject, endorsed_to, NULL, remarks FROM endorsements
+        """)
+        cur.execute("DROP TABLE endorsements")
+        cur.execute("ALTER TABLE endorsements_new RENAME TO endorsements")
     con.commit()
     con.close()
 
 
 def load_departments():
-    """Load department names from DB into the global DEPARTMENTS list."""
     global DEPARTMENTS
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
@@ -137,9 +176,30 @@ def delete_department(dept_id):
     con.close()
 
 
+def get_monthly_summary():
+    """Return (incoming_count, outgoing_count) for the current month."""
+    now = datetime.now()
+    prefix = f"{now.year}-{now.month:02d}%"
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("SELECT COUNT(*) FROM memos WHERE date LIKE ?", (prefix,))
+    inc = cur.fetchone()[0]
+    cur.execute("SELECT COUNT(*) FROM outgoing WHERE date LIKE ?", (prefix,))
+    out = cur.fetchone()[0]
+    con.close()
+    return inc, out
+
+
 # ── Generic DB helpers ────────────────────────────────────────────────────────
+MONTH_NUMS = {
+    "January": "01", "February": "02", "March": "03", "April": "04",
+    "May": "05", "June": "06", "July": "07", "August": "08",
+    "September": "09", "October": "10", "November": "11", "December": "12",
+}
+
+
 def _fetch(table, search_cols, query="", sort_col=None, sort_asc=True,
-           date_from=None, date_to=None, dept_col=None, dept_val=None):
+           month=None, year=None, dept_col=None, dept_val=None):
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
     direction = "ASC" if sort_asc else "DESC"
@@ -152,12 +212,19 @@ def _fetch(table, search_cols, query="", sort_col=None, sort_asc=True,
         q = f"%{query}%"
         conditions.append("(" + " OR ".join(f"{c} LIKE ?" for c in search_cols) + ")")
         params.extend([q] * len(search_cols))
-    if date_from:
-        conditions.append("date >= ?")
-        params.append(date_from)
-    if date_to:
-        conditions.append("date <= ?")
-        params.append(date_to + "  23:59")
+
+    has_year  = year  and year  != "All Years"
+    has_month = month and month != "All Months"
+    if has_year and has_month:
+        conditions.append("date LIKE ?")
+        params.append(f"{year}-{MONTH_NUMS[month]}%")
+    elif has_year:
+        conditions.append("date LIKE ?")
+        params.append(f"{year}%")
+    elif has_month:
+        conditions.append("date LIKE ?")
+        params.append(f"____-{MONTH_NUMS[month]}%")
+
     if dept_col and dept_val and dept_val != "All Departments":
         conditions.append(f"{dept_col} = ?")
         params.append(dept_val)
@@ -195,8 +262,107 @@ def _update(table, cols, vals, row_id):
     con.close()
 
 
+def read_import_file(path):
+    """
+    Read a .csv or .xlsx file and return (headers, rows).
+    Returns (None, error_message) on failure.
+    """
+    ext = os.path.splitext(path)[1].lower()
+    try:
+        if ext == ".xlsx":
+            if not XLSX_SUPPORTED:
+                return None, "openpyxl is not installed.\nRun: pip install openpyxl"
+            wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+            ws = wb.active
+            all_rows = list(ws.iter_rows(values_only=True))
+            wb.close()
+            if not all_rows:
+                return None, "The Excel file appears to be empty."
+            # Find the first non-empty row as the header
+            header_row = None
+            data_start = 0
+            for i, row in enumerate(all_rows):
+                if any(v is not None for v in row):
+                    header_row = row
+                    data_start = i + 1
+                    break
+            if header_row is None:
+                return None, "Could not find a header row in the Excel file."
+            headers = [str(h).strip() if h is not None else f"Col{i}"
+                       for i, h in enumerate(header_row)]
+            rows = []
+            for r in all_rows[data_start:]:
+                if not any(v is not None for v in r):
+                    continue  # skip empty rows
+                row_dict = {}
+                for i, v in enumerate(r):
+                    if i < len(headers):
+                        row_dict[headers[i]] = str(v).strip() if v is not None else ""
+                rows.append(row_dict)
+            return headers, rows
+        else:
+            with open(path, newline="", encoding="utf-8-sig") as f:
+                raw = f.read()
+            # Strip leading blank lines before passing to DictReader
+            lines = raw.splitlines()
+            non_empty = [l for l in lines if l.strip().replace(",", "")]
+            if not non_empty:
+                return None, "The CSV file appears to be empty."
+            cleaned = "\n".join(non_empty)
+            import io
+            reader = csv.DictReader(io.StringIO(cleaned))
+            headers = [h.strip() for h in (reader.fieldnames or [])]
+            rows = []
+            for r in reader:
+                row_dict = {k.strip(): (v.strip() if v else "")
+                            for k, v in r.items() if k is not None}
+                rows.append(row_dict)
+            return headers, rows
+    except Exception as e:
+        return None, str(e)
+
+
+def _exists(table, match_cols, match_vals):
+    """Return True if a row matching all given col=val pairs already exists."""
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    where = " AND ".join(f"{c} = ?" for c in match_cols)
+    cur.execute(f"SELECT 1 FROM {table} WHERE {where} LIMIT 1", match_vals)
+    found = cur.fetchone() is not None
+    con.close()
+    return found
+
+
 def now_str():
     return datetime.now().strftime("%Y-%m-%d  %H:%M")
+
+
+def now_date_str():
+    return datetime.now().strftime("%Y-%m-%d")
+
+
+def parse_date_flexible(s):
+    """
+    Accept many date formats and return YYYY-MM-DD string.
+    Returns None if no format matches.
+    """
+    s = s.strip()
+    formats = [
+        "%m/%d/%Y",   # 07/14/2025
+        "%m-%d-%Y",   # 07-14-2025
+        "%m/%d/%y",   # 07/14/25
+        "%B %d, %Y",  # July 14, 2025
+        "%b %d, %Y",  # Jul 14, 2025
+        "%d/%m/%Y",   # 14/07/2025
+        "%Y-%m-%d",   # 2025-07-14  (already stored format)
+        "%Y/%m/%d",   # 2025/07/14
+    ]
+    for fmt in formats:
+        try:
+            return datetime.strptime(s, fmt).strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+    return None
 
 
 # ── Reusable widget helpers ───────────────────────────────────────────────────
@@ -232,7 +398,45 @@ def make_button(parent, text, cmd, fg, hover, text_color="#FFFFFF",
     return ctk.CTkButton(parent, **kw)
 
 
-# ── Edit Record Popup ─────────────────────────────────────────────────────────
+# ── Print helper ──────────────────────────────────────────────────────────────
+def print_record(fields, title="Memo Record"):
+    """Generate a simple HTML file and open it in the default browser for printing."""
+    import tempfile, webbrowser
+    rows_html = ""
+    for label, value in fields:
+        rows_html += f"""
+        <tr>
+            <td style="font-weight:bold;color:#5D6D7E;padding:8px 12px;
+                       border-bottom:1px solid #D5D8DC;width:160px;">{label}</td>
+            <td style="padding:8px 12px;border-bottom:1px solid #D5D8DC;">{value or '—'}</td>
+        </tr>"""
+    html = f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<title>{title}</title>
+<style>
+  body {{ font-family: Georgia, serif; margin: 40px; color: #1C2833; }}
+  h2   {{ color: #1B4F72; border-bottom: 2px solid #1B4F72; padding-bottom: 8px; }}
+  table {{ border-collapse: collapse; width: 100%; max-width: 600px; }}
+  @media print {{ button {{ display:none; }} }}
+</style>
+</head><body>
+<h2>🗂 Office Memo Tracker — {title}</h2>
+<p style="color:#5D6D7E;font-size:13px;">Printed: {datetime.now().strftime('%B %d, %Y  %H:%M')}</p>
+<table>{rows_html}</table>
+<br>
+<button onclick="window.print()" style="padding:8px 20px;font-size:14px;
+  background:#1B4F72;color:white;border:none;border-radius:6px;cursor:pointer;">
+  🖨 Print
+</button>
+</body></html>"""
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".html",
+                                     mode="w", encoding="utf-8")
+    tmp.write(html)
+    tmp.close()
+    webbrowser.open(f"file://{tmp.name}")
+
+
+# ── Edit Record Popups ────────────────────────────────────────────────────────
 class EditMemoPopup(ctk.CTkToplevel):
     def __init__(self, parent, row, on_save, on_delete):
         super().__init__(parent)
@@ -241,7 +445,7 @@ class EditMemoPopup(ctk.CTkToplevel):
         self._on_save   = on_save
         self._on_delete = on_delete
         self.title(f"Edit Memo #{memo_id}")
-        self.geometry("520x500")
+        self.geometry("520x540")
         self.resizable(False, False)
         self.grab_set()
         self.configure(fg_color=SURFACE)
@@ -254,79 +458,61 @@ class EditMemoPopup(ctk.CTkToplevel):
 
         scroll = ctk.CTkScrollableFrame(self, fg_color=SURFACE, corner_radius=0,
                                         scrollbar_button_color=BORDER)
-        scroll.grid(row=1, column=0, sticky="nsew", padx=0, pady=0)
+        scroll.grid(row=1, column=0, sticky="nsew")
 
-        make_label(scroll, f"Edit Memo #{memo_id}", size=15, weight="bold",
-                   color=accent).pack(anchor="w", padx=28, pady=(18, 16))
+        make_label(scroll, f"Edit Incoming Memo #{memo_id}", size=15,
+                   weight="bold", color=accent).pack(anchor="w", padx=28, pady=(18, 16))
 
-        # Date
-        make_label(scroll, "Date (YYYY-MM-DD)", size=11, weight="bold",
-                   color=TEXT_SUB).pack(anchor="w", padx=28, pady=(0, 2))
-        self._date_var = ctk.StringVar(value=date.strip())
-        make_entry(scroll, self._date_var, width=440
-                   ).pack(fill="x", padx=28, pady=(0, 10))
+        for lbl, var_name, default in [
+            ("Date (YYYY-MM-DD)", "_date_var", date.split("  ")[0].strip()),
+            ("Subject", "_subj_var", subj),
+            ("Received By", "_recv_var", recv),
+        ]:
+            make_label(scroll, lbl, size=11, weight="bold",
+                       color=TEXT_SUB).pack(anchor="w", padx=28, pady=(0, 2))
+            setattr(self, var_name, ctk.StringVar(value=default))
+            make_entry(scroll, getattr(self, var_name), width=440
+                       ).pack(fill="x", padx=28, pady=(0, 10))
 
-        # Department
         make_label(scroll, "From Department", size=11, weight="bold",
                    color=TEXT_SUB).pack(anchor="w", padx=28, pady=(0, 2))
         self._dept_var = ctk.StringVar(value=dept)
         make_option(scroll, self._dept_var, DEPARTMENTS[1:],
                     accent, "#154360", width=440).pack(anchor="w", padx=28, pady=(0, 10))
 
-        # Subject
-        make_label(scroll, "Subject", size=11, weight="bold",
-                   color=TEXT_SUB).pack(anchor="w", padx=28, pady=(0, 2))
-        self._subj_var = ctk.StringVar(value=subj)
-        make_entry(scroll, self._subj_var, width=440
-                   ).pack(fill="x", padx=28, pady=(0, 10))
-
-        # Received By
-        make_label(scroll, "Received By", size=11, weight="bold",
-                   color=TEXT_SUB).pack(anchor="w", padx=28, pady=(0, 2))
-        self._recv_var = ctk.StringVar(value=recv)
-        make_entry(scroll, self._recv_var, width=440
-                   ).pack(fill="x", padx=28, pady=(0, 10))
-
-        # Buttons
         btn_frame = ctk.CTkFrame(scroll, fg_color="transparent")
         btn_frame.pack(fill="x", padx=28, pady=(10, 24))
-
         make_button(btn_frame, "  💾  Save Changes", self._save,
-                    accent, "#154360", height=40, width=180
-                    ).pack(side="left")
+                    accent, "#154360", height=40, width=180).pack(side="left")
         make_button(btn_frame, "Cancel", self.destroy,
                     BORDER, "#BFC9CA", text_color=TEXT_MAIN,
-                    height=40, width=90, radius=8
-                    ).pack(side="left", padx=(10, 0))
+                    height=40, width=90, radius=8).pack(side="left", padx=(10, 0))
         make_button(btn_frame, "  🗑  Delete", self._delete,
                     "#FADBD8", "#F1948A", text_color=DANGER,
-                    height=40, width=110, radius=8
-                    ).pack(side="right")
+                    height=40, width=110, radius=8).pack(side="right")
 
     def _save(self):
-        date = self._date_var.get().strip()
-        dept = self._dept_var.get()
+        date_raw = self._date_var.get().strip()
+        try:
+            datetime.strptime(date_raw, "%Y-%m-%d")
+        except ValueError:
+            messagebox.showwarning("Invalid Date", "Use YYYY-MM-DD format.", parent=self)
+            return
         subj = self._subj_var.get().strip()
         recv = self._recv_var.get().strip()
-        try:
-            datetime.strptime(date, "%Y-%m-%d")
-        except ValueError:
-            messagebox.showwarning("Invalid Date",
-                                   "Please use YYYY-MM-DD format.", parent=self)
-            return
         if not subj:
             messagebox.showwarning("Missing", "Subject cannot be empty.", parent=self)
             return
         if not recv:
             messagebox.showwarning("Missing", "Received By cannot be empty.", parent=self)
             return
-        self._on_save(self._id, date, dept, subj, recv)
+        # Preserve original time if present, otherwise use current time
+        self._on_save(self._id, date_raw, self._dept_var.get(), subj, recv)
         self.destroy()
 
     def _delete(self):
         if messagebox.askyesno("Confirm Delete",
-                               f"Delete memo #{self._id}? This cannot be undone.",
-                               parent=self):
+                               f"Delete memo #{self._id}?", parent=self):
             self._on_delete(self._id)
             self.destroy()
 
@@ -339,7 +525,7 @@ class EditOutgoingPopup(ctk.CTkToplevel):
         self._on_save   = on_save
         self._on_delete = on_delete
         self.title(f"Edit Outgoing Memo #{rid}")
-        self.geometry("520x480")
+        self.geometry("520x520")
         self.resizable(False, False)
         self.grab_set()
         self.configure(fg_color=SURFACE)
@@ -352,142 +538,147 @@ class EditOutgoingPopup(ctk.CTkToplevel):
 
         scroll = ctk.CTkScrollableFrame(self, fg_color=SURFACE, corner_radius=0,
                                         scrollbar_button_color=BORDER)
-        scroll.grid(row=1, column=0, sticky="nsew", padx=0, pady=0)
+        scroll.grid(row=1, column=0, sticky="nsew")
 
-        make_label(scroll, f"Edit Outgoing Memo #{rid}", size=15, weight="bold",
-                   color=accent).pack(anchor="w", padx=28, pady=(18, 16))
+        make_label(scroll, f"Edit Outgoing Memo #{rid}", size=15,
+                   weight="bold", color=accent).pack(anchor="w", padx=28, pady=(18, 16))
 
-        # Date
-        make_label(scroll, "Date (YYYY-MM-DD)", size=11, weight="bold",
-                   color=TEXT_SUB).pack(anchor="w", padx=28, pady=(0, 2))
-        self._date_var = ctk.StringVar(value=date.strip())
-        make_entry(scroll, self._date_var, width=440
-                   ).pack(fill="x", padx=28, pady=(0, 10))
+        for lbl, var_name, default in [
+            ("Date (YYYY-MM-DD)", "_date_var", date.split("  ")[0].strip()),
+            ("Subject", "_subj_var", subj),
+            ("Remarks (optional)", "_remarks_var", remarks or ""),
+        ]:
+            make_label(scroll, lbl, size=11, weight="bold",
+                       color=TEXT_SUB).pack(anchor="w", padx=28, pady=(0, 2))
+            setattr(self, var_name, ctk.StringVar(value=default))
+            make_entry(scroll, getattr(self, var_name), width=440
+                       ).pack(fill="x", padx=28, pady=(0, 10))
 
-        # Subject
-        make_label(scroll, "Subject", size=11, weight="bold",
-                   color=TEXT_SUB).pack(anchor="w", padx=28, pady=(0, 2))
-        self._subj_var = ctk.StringVar(value=subj)
-        make_entry(scroll, self._subj_var, width=440
-                   ).pack(fill="x", padx=28, pady=(0, 10))
-
-        # Department Sent To
         make_label(scroll, "Department Sent To", size=11, weight="bold",
                    color=TEXT_SUB).pack(anchor="w", padx=28, pady=(0, 2))
         self._recip_var = ctk.StringVar(value=recip)
         make_option(scroll, self._recip_var, DEPARTMENTS[1:],
                     accent, "#154360", width=440).pack(anchor="w", padx=28, pady=(0, 10))
 
-        # Remarks
-        make_label(scroll, "Remarks (optional)", size=11, weight="bold",
-                   color=TEXT_SUB).pack(anchor="w", padx=28, pady=(0, 2))
-        self._remarks_var = ctk.StringVar(value=remarks or "")
-        make_entry(scroll, self._remarks_var, width=440
-                   ).pack(fill="x", padx=28, pady=(0, 10))
-
-        # Buttons
         btn_frame = ctk.CTkFrame(scroll, fg_color="transparent")
         btn_frame.pack(fill="x", padx=28, pady=(10, 24))
-
         make_button(btn_frame, "  💾  Save Changes", self._save,
-                    accent, "#154360", height=40, width=180
-                    ).pack(side="left")
+                    accent, "#154360", height=40, width=180).pack(side="left")
         make_button(btn_frame, "Cancel", self.destroy,
                     BORDER, "#BFC9CA", text_color=TEXT_MAIN,
-                    height=40, width=90, radius=8
-                    ).pack(side="left", padx=(10, 0))
+                    height=40, width=90, radius=8).pack(side="left", padx=(10, 0))
         make_button(btn_frame, "  🗑  Delete", self._delete,
                     "#FADBD8", "#F1948A", text_color=DANGER,
-                    height=40, width=110, radius=8
-                    ).pack(side="right")
+                    height=40, width=110, radius=8).pack(side="right")
 
     def _save(self):
-        date    = self._date_var.get().strip()
-        subj    = self._subj_var.get().strip()
-        recip   = self._recip_var.get()
-        remarks = self._remarks_var.get().strip()
+        date_raw = self._date_var.get().strip()
         try:
-            datetime.strptime(date, "%Y-%m-%d")
+            datetime.strptime(date_raw, "%Y-%m-%d")
         except ValueError:
-            messagebox.showwarning("Invalid Date",
-                                   "Please use YYYY-MM-DD format.", parent=self)
+            messagebox.showwarning("Invalid Date", "Use YYYY-MM-DD format.", parent=self)
             return
+        subj = self._subj_var.get().strip()
         if not subj:
             messagebox.showwarning("Missing", "Subject cannot be empty.", parent=self)
             return
-        self._on_save(self._id, date, subj, recip, remarks)
+        self._on_save(self._id, date_raw, self._subj_var.get().strip(),
+                      self._recip_var.get(), self._remarks_var.get().strip())
         self.destroy()
 
     def _delete(self):
         if messagebox.askyesno("Confirm Delete",
-                               f"Delete outgoing memo #{self._id}? This cannot be undone.",
-                               parent=self):
+                               f"Delete outgoing memo #{self._id}?", parent=self):
             self._on_delete(self._id)
             self.destroy()
 
 
 
-# ── Date Picker Popup ─────────────────────────────────────────────────────────
-class DatePickerPopup(ctk.CTkToplevel):
-    """Small calendar popup. Calls on_select(date_str) on confirmation."""
-    def __init__(self, parent, current_date, on_select):
+# ── Edit Endorsement Popup ────────────────────────────────────────────────────
+class EditEndorsementPopup(ctk.CTkToplevel):
+    def __init__(self, parent, row, on_save, on_delete):
         super().__init__(parent)
-        self._on_select = on_select
-        self.title("Pick a Date")
+        if len(row) == 7:
+            rid, date, name, subj, endorsed_to, office, remarks = row
+        else:
+            rid, date, name, subj, endorsed_to, remarks = row
+            office = ""
+        self._id        = rid
+        self._on_save   = on_save
+        self._on_delete = on_delete
+        self.title(f"Edit Endorsement #{rid}")
+        self.geometry("520x520")
         self.resizable(False, False)
         self.grab_set()
         self.configure(fg_color=SURFACE)
+        self.grid_rowconfigure(1, weight=1)
+        self.grid_columnconfigure(0, weight=1)
 
-        # Parse current date if set, else use today
-        try:
-            dt = datetime.strptime(current_date.strip(), "%Y-%m-%d")
-        except Exception:
-            dt = datetime.today()
+        accent = TAB_COLORS["Endorsements"]["accent"]
+        ctk.CTkFrame(self, fg_color=accent, corner_radius=0, height=6
+                     ).grid(row=0, column=0, sticky="ew")
 
-        ctk.CTkFrame(self, fg_color=ACCENT, corner_radius=0, height=6
-                     ).pack(fill="x")
+        scroll = ctk.CTkScrollableFrame(self, fg_color=SURFACE, corner_radius=0,
+                                        scrollbar_button_color=BORDER)
+        scroll.grid(row=1, column=0, sticky="nsew")
 
-        self._cal = Calendar(
-            self,
-            selectmode="day",
-            year=dt.year, month=dt.month, day=dt.day,
-            date_pattern="yyyy-mm-dd",
-            background=ACCENT,
-            foreground="#FFFFFF",
-            headersbackground=ACCENT_DARK,
-            headersforeground="#FFFFFF",
-            selectbackground="#2E86C1",
-            selectforeground="#FFFFFF",
-            normalbackground=CARD,
-            normalforeground=TEXT_MAIN,
-            weekendbackground=ROW_ALT,
-            weekendforeground=TEXT_MAIN,
-            othermonthbackground=SURFACE,
-            othermonthforeground=TEXT_SUB,
-            bordercolor=BORDER,
-            font=("Helvetica", 10),
-        )
-        self._cal.pack(padx=16, pady=(12, 8))
+        make_label(scroll, f"Edit Endorsement #{rid}", size=15,
+                   weight="bold", color=accent).pack(anchor="w", padx=28, pady=(18, 16))
 
-        btn_row = ctk.CTkFrame(self, fg_color=SURFACE, corner_radius=0)
-        btn_row.pack(fill="x", padx=16, pady=(0, 14))
-        make_button(btn_row, "  ✔  Select", self._confirm,
-                    ACCENT, ACCENT_DARK, height=34, width=120, radius=6
-                    ).pack(side="left")
-        make_button(btn_row, "Clear Date", self._clear,
+        for lbl, var_name, default in [
+            ("Date (YYYY-MM-DD)",       "_date_var",        date.split("  ")[0].strip()),
+            ("Name (Who is Endorsed)",  "_name_var",        name),
+            ("Subject",                 "_subj_var",        subj),
+            ("Endorsed To",             "_endorsed_to_var", endorsed_to),
+            ("Office",                  "_office_var",      office or ""),
+            ("Remarks (optional)",      "_remarks_var",     remarks or ""),
+        ]:
+            make_label(scroll, lbl, size=11, weight="bold",
+                       color=TEXT_SUB).pack(anchor="w", padx=28, pady=(0, 2))
+            setattr(self, var_name, ctk.StringVar(value=default))
+            make_entry(scroll, getattr(self, var_name), width=440
+                       ).pack(fill="x", padx=28, pady=(0, 10))
+
+        btn_frame = ctk.CTkFrame(scroll, fg_color="transparent")
+        btn_frame.pack(fill="x", padx=28, pady=(10, 24))
+        make_button(btn_frame, "  💾  Save Changes", self._save,
+                    accent, "#3B1A47", height=40, width=180).pack(side="left")
+        make_button(btn_frame, "Cancel", self.destroy,
                     BORDER, "#BFC9CA", text_color=TEXT_MAIN,
-                    height=34, width=100, radius=6
-                    ).pack(side="left", padx=(8, 0))
+                    height=40, width=90, radius=8).pack(side="left", padx=(10, 0))
+        make_button(btn_frame, "  🗑  Delete", self._delete,
+                    "#FADBD8", "#F1948A", text_color=DANGER,
+                    height=40, width=110, radius=8).pack(side="right")
 
-    def _confirm(self):
-        self._on_select(self._cal.get_date())
+    def _save(self):
+        date_raw = self._date_var.get().strip()
+        parsed = parse_date_flexible(date_raw) if date_raw else None
+        if not parsed:
+            messagebox.showwarning("Invalid Date",
+                                   "Use YYYY-MM-DD or MM/DD/YYYY format.", parent=self)
+            return
+        name        = self._name_var.get().strip()
+        subj        = self._subj_var.get().strip()
+        endorsed_to = self._endorsed_to_var.get().strip()
+        office      = self._office_var.get().strip()
+        remarks     = self._remarks_var.get().strip()
+        if not name:
+            messagebox.showwarning("Missing", "Name cannot be empty.", parent=self)
+            return
+        if not subj:
+            messagebox.showwarning("Missing", "Subject cannot be empty.", parent=self)
+            return
+        self._on_save(self._id, parsed, name, subj, endorsed_to, office, remarks)
         self.destroy()
 
-    def _clear(self):
-        self._on_select("")
-        self.destroy()
+    def _delete(self):
+        if messagebox.askyesno("Confirm Delete",
+                               f"Delete endorsement #{self._id}?", parent=self):
+            self._on_delete(self._id)
+            self.destroy()
 
-# ── Past Entry Popup ──────────────────────────────────────────────────────────
+
+# ── Past Entry Popups ─────────────────────────────────────────────────────────
 class PastEntryPopup(ctk.CTkToplevel):
     TITLE  = "Log Past Entry"
     ACCENT = ACCENT
@@ -496,8 +687,8 @@ class PastEntryPopup(ctk.CTkToplevel):
         super().__init__(parent)
         self._on_save = on_save
         self.title(self.TITLE)
-        self.geometry("480x560")
-        self.minsize(480, 560)
+        self.geometry("480x600")
+        self.minsize(480, 600)
         self.resizable(False, False)
         self.grab_set()
         self.configure(fg_color=SURFACE)
@@ -508,7 +699,6 @@ class PastEntryPopup(ctk.CTkToplevel):
     def _build_ui(self):
         ctk.CTkFrame(self, fg_color=self.ACCENT, corner_radius=0, height=6
                      ).grid(row=0, column=0, sticky="ew")
-
         hdr = ctk.CTkFrame(self, fg_color=SURFACE, corner_radius=0)
         hdr.grid(row=1, column=0, sticky="ew", padx=28, pady=(18, 0))
         make_label(hdr, self.TITLE, size=15, weight="bold",
@@ -521,15 +711,16 @@ class PastEntryPopup(ctk.CTkToplevel):
                                         scrollbar_button_color=BORDER)
         scroll.grid(row=2, column=0, sticky="nsew")
 
+        # Date
         date_card = ctk.CTkFrame(scroll, fg_color=WARN_BG, corner_radius=8,
                                  border_width=1, border_color=WARN_BORDER)
         date_card.pack(fill="x", padx=28, pady=(0, 16))
-        make_label(date_card, "📅  Date  (YYYY-MM-DD)", size=11,
+        make_label(date_card, "📅  Date  (MM/DD/YYYY)", size=11,
                    weight="bold", color="#7D6608"
                    ).pack(anchor="w", padx=14, pady=(10, 2))
         self._date_var = ctk.StringVar()
         ctk.CTkEntry(date_card, textvariable=self._date_var,
-                     placeholder_text="e.g. 2025-03-15",
+                     placeholder_text="e.g. 07/14/2025",
                      fg_color=CARD, border_color=WARN_BORDER,
                      text_color=TEXT_MAIN, font=ctk.CTkFont(size=13), height=34,
                      ).pack(fill="x", padx=14, pady=(0, 10))
@@ -540,12 +731,10 @@ class PastEntryPopup(ctk.CTkToplevel):
         btn_row = ctk.CTkFrame(self, fg_color=SURFACE, corner_radius=0)
         btn_row.grid(row=3, column=0, sticky="ew", padx=28, pady=(12, 20))
         make_button(btn_row, "  ✔  Save Past Entry", self._save,
-                    self.ACCENT, "#154360", height=40, width=190
-                    ).pack(side="left")
+                    self.ACCENT, "#154360", height=40, width=190).pack(side="left")
         make_button(btn_row, "Cancel", self.destroy,
                     BORDER, "#BFC9CA", text_color=TEXT_MAIN,
-                    height=40, width=100, radius=8
-                    ).pack(side="left", padx=(10, 0))
+                    height=40, width=100, radius=8).pack(side="left", padx=(10, 0))
 
     def _build_fields(self):
         pass
@@ -553,19 +742,14 @@ class PastEntryPopup(ctk.CTkToplevel):
     def _collect_values(self):
         return ()
 
-    def _validate_date(self, s):
-        try:
-            datetime.strptime(s.strip(), "%Y-%m-%d")
-            return True
-        except ValueError:
-            return False
-
     def _save(self):
-        date_str = self._date_var.get().strip()
-        if not self._validate_date(date_str):
+        raw = self._date_var.get().strip()
+        date_str = parse_date_flexible(raw)
+        if not date_str:
             messagebox.showwarning("Invalid Date",
-                                   "Please enter a valid date in YYYY-MM-DD format.\n"
-                                   "Example: 2025-03-15", parent=self)
+                                   "Could not read that date.\n"
+                                   "Try formats like:  07/14/2025  or  July 14, 2025",
+                                   parent=self)
             return
         vals = self._collect_values()
         if vals is None:
@@ -591,12 +775,10 @@ class PastMemoPopup(PastEntryPopup):
         make_option(self._scroll, self._dept_var, DEPARTMENTS,
                     self.ACCENT, "#154360", width=400
                     ).pack(anchor="w", padx=28, pady=(4, 0))
-
         self._field_label("Subject / Memo Topic")
         make_entry(self._scroll, self._subject_var,
                    "e.g. Monthly Budget Report", width=400
                    ).pack(fill="x", padx=28, pady=(4, 0))
-
         self._field_label("Received By")
         make_entry(self._scroll, self._receiver_var,
                    "e.g. Maria Santos", width=400
@@ -631,20 +813,18 @@ class PastOutgoingPopup(PastEntryPopup):
         make_entry(self._scroll, self._subject_var,
                    "e.g. Q2 Report", width=400
                    ).pack(fill="x", padx=28, pady=(4, 0))
-
         self._field_label("Department Sent To")
         make_option(self._scroll, self._recipient_var, DEPARTMENTS,
                     self.ACCENT, "#154360", width=400
                     ).pack(anchor="w", padx=28, pady=(4, 0))
-
         self._field_label("Remarks (optional)")
         make_entry(self._scroll, self._remarks_var,
                    "e.g. Via courier", width=400
                    ).pack(fill="x", padx=28, pady=(4, 0))
 
     def _collect_values(self):
-        subj    = self._subject_var.get().strip()
-        recip   = self._recipient_var.get()
+        subj  = self._subject_var.get().strip()
+        recip = self._recipient_var.get()
         remarks = self._remarks_var.get().strip()
         if not subj:
             messagebox.showwarning("Missing", "Please enter the subject.", parent=self)
@@ -653,6 +833,57 @@ class PastOutgoingPopup(PastEntryPopup):
             messagebox.showwarning("Missing", "Please select the destination department.", parent=self)
             return None
         return (subj, recip, remarks)
+
+
+class PastEndorsementPopup(PastEntryPopup):
+    TITLE  = "Log Past Endorsement"
+    ACCENT = TAB_COLORS["Endorsements"]["accent"]
+
+    def _build_fields(self):
+        self._name_var        = ctk.StringVar()
+        self._subject_var     = ctk.StringVar()
+        self._endorsed_to_var = ctk.StringVar()
+        self._office_var      = ctk.StringVar()
+        self._remarks_var     = ctk.StringVar()
+
+        self._field_label("Name (Who is Endorsed)")
+        make_entry(self._scroll, self._name_var,
+                   "e.g. Juan dela Cruz", width=400
+                   ).pack(fill="x", padx=28, pady=(4, 0))
+        self._field_label("Subject")
+        make_entry(self._scroll, self._subject_var,
+                   "e.g. Employment Endorsement", width=400
+                   ).pack(fill="x", padx=28, pady=(4, 0))
+        self._field_label("Endorsed To")
+        make_entry(self._scroll, self._endorsed_to_var,
+                   "e.g. City Mayor", width=400
+                   ).pack(fill="x", padx=28, pady=(4, 0))
+        self._office_var = ctk.StringVar()
+        self._field_label("Office")
+        make_entry(self._scroll, self._office_var,
+                   "e.g. Office of the City Mayor", width=400
+                   ).pack(fill="x", padx=28, pady=(4, 0))
+        self._field_label("Remarks (optional)")
+        make_entry(self._scroll, self._remarks_var,
+                   "e.g. For signature", width=400
+                   ).pack(fill="x", padx=28, pady=(4, 0))
+
+    def _collect_values(self):
+        name        = self._name_var.get().strip()
+        subj        = self._subject_var.get().strip()
+        endorsed_to = self._endorsed_to_var.get().strip()
+        office      = self._office_var.get().strip()
+        remarks     = self._remarks_var.get().strip()
+        if not name:
+            messagebox.showwarning("Missing", "Please enter the name.", parent=self)
+            return None
+        if not subj:
+            messagebox.showwarning("Missing", "Please enter the subject.", parent=self)
+            return None
+        if not endorsed_to:
+            messagebox.showwarning("Missing", "Please enter who it is endorsed to.", parent=self)
+            return None
+        return (name, subj, endorsed_to, office, remarks)
 
 
 # ── Record Detail Popup ───────────────────────────────────────────────────────
@@ -688,80 +919,82 @@ class RecordDetailPopup(ctk.CTkToplevel):
             ctk.CTkFrame(card, fg_color=BORDER, height=1
                          ).pack(fill="x", padx=16, pady=(10, 0))
 
-        make_button(self, "Close", self.destroy, BORDER, "#BFC9CA",
+        btn_row = ctk.CTkFrame(self, fg_color=SURFACE, corner_radius=0)
+        btn_row.grid(row=3, column=0, pady=(0, 16))
+        make_button(btn_row, "Close", self.destroy, BORDER, "#BFC9CA",
                     text_color=TEXT_MAIN, height=36, width=100, radius=8
-                    ).grid(row=3, column=0, pady=(0, 16))
+                    ).pack(side="left")
 
 
 # ── Base Tab Panel ────────────────────────────────────────────────────────────
 class BaseTab(ctk.CTkFrame):
-    TABLE_NAME     = ""
-    SEARCH_COLS    = []
-    FORM_TITLE     = ""
-    FORM_HINT      = ""
-    COL_SPECS      = []
-    ACCENT         = ACCENT
-    DARK           = ACCENT_DARK
-    ICON           = "📋"
-    PAST_POPUP_CLS = None
-    SORT_MAP          = {}
-    DEPT_FILTER_COL   = None   # override in subclass: DB column for dept filter
+    TABLE_NAME      = ""
+    SEARCH_COLS     = []
+    FORM_TITLE      = ""
+    FORM_HINT       = ""
+    COL_SPECS       = []
+    ACCENT          = ACCENT
+    DARK            = ACCENT_DARK
+    ICON            = "📋"
+    PAST_POPUP_CLS  = None
+    SORT_MAP        = {}
+    DEPT_FILTER_COL = None
+    PAST_LABEL      = "Memo"
+    COMPACT         = False  # set True on tabs with many fields
 
     def __init__(self, parent):
         super().__init__(parent, fg_color=SURFACE, corner_radius=0)
         self.columnconfigure(0, weight=0)
         self.columnconfigure(1, weight=1)
         self.rowconfigure(0, weight=1)
-        self._sort_col    = None
-        self._sort_asc    = True
-        self._page        = 0
-        self._page_size   = 50
-        self._total_rows  = 0
+        self._sort_col     = None
+        self._sort_asc     = True
+        self._page         = 0
+        self._page_size    = 50
+        self._total_rows   = 0
         self._search_after = None
-        self._filter_from = ""
-        self._filter_to   = ""
-        self._filter_dept = "All Departments"
+        self._filter_month = "All Months"
+        self._filter_year  = "All Years"
+        self._filter_dept  = "All Departments"
         self._build_form_panel()
         self._build_records_panel()
         self._refresh()
 
     def _build_form_panel(self):
         self._form_panel = ctk.CTkFrame(self, fg_color=CARD, corner_radius=0,
-                                        width=310, border_width=0)
+                                        width=330, border_width=0)
         self._form_panel.grid(row=0, column=0, sticky="nsew")
         self._form_panel.pack_propagate(False)
 
         ctk.CTkFrame(self._form_panel, fg_color=self.ACCENT,
                      corner_radius=0, height=6).pack(fill="x")
-        make_label(self._form_panel, self.FORM_TITLE, size=16, weight="bold",
-                   color=self.ACCENT).pack(anchor="w", padx=28, pady=(20, 2))
+        tp = (10, 1) if self.COMPACT else (14, 1)
+        make_label(self._form_panel, self.FORM_TITLE, size=15, weight="bold",
+                   color=self.ACCENT).pack(anchor="w", padx=20, pady=tp)
         make_label(self._form_panel, self.FORM_HINT, size=11, weight="normal",
-                   color=TEXT_SUB).pack(anchor="w", padx=28, pady=(0, 16))
-
-        date_frame = ctk.CTkFrame(self._form_panel, fg_color=ROW_ALT, corner_radius=8)
-        date_frame.pack(fill="x", padx=28, pady=(0, 14))
-        make_label(date_frame, "Date & Time", size=11, weight="bold",
-                   color=TEXT_SUB).pack(anchor="w", padx=14, pady=(10, 0))
-        self._date_disp = make_label(date_frame, now_str(), size=13,
-                                     weight="bold", color=self.ACCENT)
-        self._date_disp.pack(anchor="w", padx=14, pady=(2, 10))
+                   color=TEXT_SUB).pack(anchor="w", padx=20, pady=(0, 4 if self.COMPACT else 8))
 
         self._build_fields(self._form_panel)
 
         make_button(self._form_panel, f"  ＋  Log {self.ICON}",
                     self._log_entry, self.ACCENT, self.DARK,
-                    height=42).pack(anchor="w", padx=28, pady=(4, 6))
-        make_button(self._form_panel, "  🕓  Log Past Memo",
-                    self._open_past_popup, SURFACE, ROW_ALT,
-                    text_color=self.ACCENT, border=self.ACCENT,
-                    height=36).pack(anchor="w", padx=28)
-
+                    height=38, width=290).pack(anchor="w", padx=20,
+                    pady=(4 if self.COMPACT else 6, 3 if self.COMPACT else 4))
+        if self.PAST_POPUP_CLS:
+            make_button(self._form_panel, f"  🕓  Log Past {self.PAST_LABEL}",
+                        self._open_past_popup, SURFACE, ROW_ALT,
+                        text_color=self.ACCENT, border=self.ACCENT,
+                        height=34, width=290).pack(anchor="w", padx=20)
         ctk.CTkFrame(self._form_panel, fg_color=BORDER, height=1
-                     ).pack(fill="x", padx=28, pady=18)
+                     ).pack(fill="x", padx=20, pady=6)
         make_button(self._form_panel, "  ↓  Export to CSV",
                     self._export_csv, SURFACE, ROW_ALT,
                     text_color=self.ACCENT, border=self.ACCENT,
-                    height=36).pack(anchor="w", padx=28)
+                    height=34, width=290).pack(anchor="w", padx=20, pady=(0, 4))
+        make_button(self._form_panel, "  ↑  Import from CSV",
+                    self._import_csv, SURFACE, ROW_ALT,
+                    text_color=self.ACCENT, border=self.ACCENT,
+                    height=34, width=290).pack(anchor="w", padx=20)
 
     def _open_past_popup(self):
         if self.PAST_POPUP_CLS:
@@ -772,7 +1005,7 @@ class BaseTab(ctk.CTkFrame):
 
     def _field_label(self, parent, text):
         make_label(parent, text, size=11, weight="bold",
-                   color=TEXT_SUB).pack(anchor="w", padx=28, pady=(6, 0))
+                   color=TEXT_SUB).pack(anchor="w", padx=20, pady=(4, 0))
 
     def _build_fields(self, parent):
         pass
@@ -787,10 +1020,14 @@ class BaseTab(ctk.CTkFrame):
                    color=self.ACCENT).pack(side="left")
         self._count_lbl = make_label(top, "", size=11, weight="normal", color=TEXT_SUB)
         self._count_lbl.pack(side="left", padx=10)
+        # Active filter indicator
+        self._filter_indicator = make_label(top, "", size=11, weight="bold",
+                                            color=ACTIVE_FILTER_FG)
+        self._filter_indicator.pack(side="left", padx=4)
 
         sf = ctk.CTkFrame(panel, fg_color=SURFACE, corner_radius=0)
         sf.pack(fill="x", padx=24, pady=(10, 0))
-        self._search_var  = ctk.StringVar()
+        self._search_var   = ctk.StringVar()
         self._search_after = None
         self._search_var.trace_add("write", lambda *_: self._debounced_refresh())
         ctk.CTkEntry(sf, textvariable=self._search_var,
@@ -803,53 +1040,56 @@ class BaseTab(ctk.CTkFrame):
                     height=36, width=68, radius=8
                     ).pack(side="left", padx=(8, 0))
 
-        # ── Filter bar ──
+        # Filter bar
         fbar = ctk.CTkFrame(panel, fg_color=CARD, corner_radius=8,
                             border_width=1, border_color=BORDER)
         fbar.pack(fill="x", padx=24, pady=(6, 0))
 
-        # From date picker
-        make_label(fbar, "From:", size=11, weight="bold",
-                   color=TEXT_SUB).pack(side="left", padx=(10, 4), pady=8)
-        self._from_var = ctk.StringVar(value="")
-        self._from_btn = ctk.CTkButton(
-            fbar, textvariable=self._from_var,
-            text="📅  Pick Date",
-            command=lambda: DatePickerPopup(self, self._from_var.get(),
-                                            self._set_from_date),
-            fg_color=ROW_ALT, hover_color=BORDER,
-            text_color=TEXT_MAIN, font=ctk.CTkFont(size=12),
-            width=120, height=30, corner_radius=6)
-        self._from_btn.pack(side="left", padx=(0, 10), pady=6)
+        make_label(fbar, "Month:", size=11, weight="bold",
+                   color=TEXT_SUB).pack(side="left", padx=(12, 4), pady=8)
+        months = ["All Months","January","February","March","April","May","June",
+                  "July","August","September","October","November","December"]
+        self._month_var = ctk.StringVar(value="All Months")
+        ctk.CTkOptionMenu(fbar, variable=self._month_var, values=months,
+                          command=lambda _: self._apply_filters(),
+                          fg_color=CARD, button_color=self.ACCENT,
+                          button_hover_color=self.DARK, text_color=TEXT_MAIN,
+                          dropdown_fg_color=CARD, dropdown_text_color=TEXT_MAIN,
+                          dropdown_hover_color=ROW_ALT,
+                          font=ctk.CTkFont(size=12), width=130, height=30,
+                          ).pack(side="left", padx=(0, 10), pady=6)
 
-        # To date picker
-        make_label(fbar, "To:", size=11, weight="bold",
+        make_label(fbar, "Year:", size=11, weight="bold",
                    color=TEXT_SUB).pack(side="left", padx=(0, 4))
-        self._to_var = ctk.StringVar(value="")
-        self._to_btn = ctk.CTkButton(
-            fbar, textvariable=self._to_var,
-            text="📅  Pick Date",
-            command=lambda: DatePickerPopup(self, self._to_var.get(),
-                                            self._set_to_date),
-            fg_color=ROW_ALT, hover_color=BORDER,
-            text_color=TEXT_MAIN, font=ctk.CTkFont(size=12),
-            width=120, height=30, corner_radius=6)
-        self._to_btn.pack(side="left", padx=(0, 12), pady=6)
+        cur_year = datetime.now().year
+        years = ["All Years"] + [str(y) for y in range(cur_year, cur_year - 10, -1)]
+        self._year_var = ctk.StringVar(value="All Years")
+        ctk.CTkOptionMenu(fbar, variable=self._year_var, values=years,
+                          command=lambda _: self._apply_filters(),
+                          fg_color=CARD, button_color=self.ACCENT,
+                          button_hover_color=self.DARK, text_color=TEXT_MAIN,
+                          dropdown_fg_color=CARD, dropdown_text_color=TEXT_MAIN,
+                          dropdown_hover_color=ROW_ALT,
+                          font=ctk.CTkFont(size=12), width=100, height=30,
+                          ).pack(side="left", padx=(0, 14), pady=6)
 
-        # Department filter
-        make_label(fbar, "Dept:", size=11, weight="bold",
-                   color=TEXT_SUB).pack(side="left", padx=(0, 4))
-        self._dept_filter_var = ctk.StringVar(value="All Departments")
-        self._dept_filter_menu = ctk.CTkOptionMenu(
-            fbar, variable=self._dept_filter_var,
-            values=["All Departments"] + DEPARTMENTS[1:],
-            command=lambda _: self._apply_filters(),
-            fg_color=CARD, button_color=self.ACCENT,
-            button_hover_color=self.DARK, text_color=TEXT_MAIN,
-            dropdown_fg_color=CARD, dropdown_text_color=TEXT_MAIN,
-            dropdown_hover_color=ROW_ALT,
-            font=ctk.CTkFont(size=12), width=200, height=30)
-        self._dept_filter_menu.pack(side="left", padx=(0, 8), pady=6)
+        if self.DEPT_FILTER_COL:
+            make_label(fbar, "Department:", size=11, weight="bold",
+                       color=TEXT_SUB).pack(side="left", padx=(0, 4))
+            self._dept_filter_var = ctk.StringVar(value="All Departments")
+            self._dept_filter_menu = ctk.CTkOptionMenu(
+                fbar, variable=self._dept_filter_var,
+                values=["All Departments"] + DEPARTMENTS[1:],
+                command=lambda _: self._apply_filters(),
+                fg_color=CARD, button_color=self.ACCENT,
+                button_hover_color=self.DARK, text_color=TEXT_MAIN,
+                dropdown_fg_color=CARD, dropdown_text_color=TEXT_MAIN,
+                dropdown_hover_color=ROW_ALT,
+                font=ctk.CTkFont(size=12), width=200, height=30)
+            self._dept_filter_menu.pack(side="left", padx=(0, 10), pady=6)
+        else:
+            self._dept_filter_var  = ctk.StringVar(value="All Departments")
+            self._dept_filter_menu = None
 
         make_button(fbar, "Reset", self._reset_filters,
                     BORDER, "#BFC9CA", text_color=TEXT_MAIN,
@@ -882,8 +1122,7 @@ class BaseTab(ctk.CTkFrame):
                                        height=28, width=80, corner_radius=6)
         self._prev_btn.pack(side="left", padx=(8, 4), pady=4)
         self._page_lbl = ctk.CTkLabel(self._page_bar, text="",
-                                      font=ctk.CTkFont(size=11),
-                                      text_color=TEXT_SUB)
+                                      font=ctk.CTkFont(size=11), text_color=TEXT_SUB)
         self._page_lbl.pack(side="left", padx=8)
         self._next_btn = ctk.CTkButton(self._page_bar, text="Next  ▶",
                                        command=self._next_page,
@@ -899,14 +1138,11 @@ class BaseTab(ctk.CTkFrame):
         q = self._search_var.get().strip()
         all_rows = _fetch(self.TABLE_NAME, self.SEARCH_COLS, q,
                           self._sort_col, self._sort_asc,
-                          date_from=self._filter_from,
-                          date_to=self._filter_to,
-                          dept_col=self.DEPT_FILTER_COL,
-                          dept_val=self._filter_dept)
+                          month=self._filter_month, year=self._filter_year,
+                          dept_col=self.DEPT_FILTER_COL, dept_val=self._filter_dept)
         self._total_rows = len(all_rows)
 
-        # Clamp page index
-        total_pages = max(1, -(-self._total_rows // self._page_size))  # ceil div
+        total_pages = max(1, -(-self._total_rows // self._page_size))
         if self._page >= total_pages:
             self._page = total_pages - 1
 
@@ -915,11 +1151,19 @@ class BaseTab(ctk.CTkFrame):
 
         self._count_lbl.configure(
             text=f"({self._total_rows} record{'s' if self._total_rows!=1 else ''})")
-        # Update pagination bar
+
+        # Active filter indicator
+        active = []
+        if self._filter_month != "All Months": active.append(self._filter_month)
+        if self._filter_year  != "All Years":  active.append(self._filter_year)
+        if self._filter_dept  != "All Departments": active.append("dept filtered")
+        self._filter_indicator.configure(
+            text=f"● Filtered: {', '.join(active)}" if active else "")
+
         self._page_lbl.configure(
-            text=f"Page {self._page+1} of {total_pages}  "
-                 f"({start+1}–{min(start+self._page_size, self._total_rows)} "
-                 f"of {self._total_rows})" if self._total_rows else "No records")
+            text=(f"Page {self._page+1} of {total_pages}  "
+                  f"({start+1}–{min(start+self._page_size, self._total_rows)} "
+                  f"of {self._total_rows})") if self._total_rows else "No records")
         self._prev_btn.configure(state="normal" if self._page > 0 else "disabled")
         self._next_btn.configure(state="normal" if self._page < total_pages-1 else "disabled")
 
@@ -946,47 +1190,24 @@ class BaseTab(ctk.CTkFrame):
             self._page += 1
             self._refresh()
 
-    def _set_from_date(self, date_str):
-        self._from_var.set(date_str if date_str else "📅  Pick Date")
-        self._from_btn.configure(
-            text="" if date_str else "📅  Pick Date",
-            fg_color="#D5F5E3" if date_str else ROW_ALT,
-            text_color="#1E8449" if date_str else TEXT_MAIN)
-        self._filter_from = date_str
-        self._page = 0
-        self._refresh()
-
-    def _set_to_date(self, date_str):
-        self._to_var.set(date_str if date_str else "📅  Pick Date")
-        self._to_btn.configure(
-            text="" if date_str else "📅  Pick Date",
-            fg_color="#D5F5E3" if date_str else ROW_ALT,
-            text_color="#1E8449" if date_str else TEXT_MAIN)
-        self._filter_to = date_str
-        self._page = 0
-        self._refresh()
-
     def _apply_filters(self):
-        """Called by dept dropdown change."""
-        self._filter_dept = self._dept_filter_var.get()
+        self._filter_month = self._month_var.get()
+        self._filter_year  = self._year_var.get()
+        self._filter_dept  = self._dept_filter_var.get()
         self._page = 0
         self._debounced_refresh()
 
     def _reset_filters(self):
-        self._from_var.set("")
-        self._to_var.set("")
+        self._month_var.set("All Months")
+        self._year_var.set("All Years")
         self._dept_filter_var.set("All Departments")
-        self._filter_from = ""
-        self._filter_to   = ""
-        self._filter_dept = "All Departments"
+        self._filter_month = "All Months"
+        self._filter_year  = "All Years"
+        self._filter_dept  = "All Departments"
         self._page = 0
-        for btn, label in ((self._from_btn, "📅  Pick Date"),
-                           (self._to_btn,   "📅  Pick Date")):
-            btn.configure(text=label, fg_color=ROW_ALT, text_color=TEXT_MAIN)
         self._refresh()
 
     def _debounced_refresh(self):
-        """Wait 200 ms after last keystroke before refreshing the table."""
         if self._search_after is not None:
             self.after_cancel(self._search_after)
         self._search_after = self.after(200, self._refresh)
@@ -1003,23 +1224,22 @@ class BaseTab(ctk.CTkFrame):
             arrow = (" ▲" if self._sort_asc else " ▼") if is_sorted else ""
             cell = ctk.CTkFrame(self._hdr_frame, fg_color="transparent",
                                 width=col_w, height=38)
-            cell.pack(side="left", padx=(4 if col_name == "#" else 2, 0))
+            cell.pack(side="left", padx=0)
             cell.pack_propagate(False)
             if db_col:
-                ctk.CTkButton(
-                    cell, text=f"{col_name}{arrow}",
-                    command=lambda c=db_col: self._sort_by(c),
-                    fg_color="transparent", hover_color="#2E6DA4",
-                    text_color="#FFFFFF",
-                    font=ctk.CTkFont(size=12, weight="bold"),
-                    anchor=col_anchor, height=38, corner_radius=0,
-                ).place(relx=0, rely=0, relwidth=1, relheight=1)
+                btn = ctk.CTkButton(cell, text=f"{col_name}{arrow}",
+                              command=lambda c=db_col: self._sort_by(c),
+                              fg_color="transparent", hover_color="#2E6DA4",
+                              text_color="#FFFFFF",
+                              font=ctk.CTkFont(size=12, weight="bold"),
+                              anchor=col_anchor, height=38, corner_radius=0,
+                              )
+                btn.place(relx=0, rely=0, relwidth=1, relheight=1)
             else:
-                ctk.CTkLabel(
-                    cell, text=col_name,
-                    font=ctk.CTkFont(size=12, weight="bold"),
-                    text_color="#FFFFFF", anchor=col_anchor,
-                ).place(relx=0, rely=0, relwidth=1, relheight=1)
+                ctk.CTkLabel(cell, text=col_name,
+                             font=ctk.CTkFont(size=12, weight="bold"),
+                             text_color="#FFFFFF", anchor=col_anchor,
+                             ).place(relx=0, rely=0, relwidth=1, relheight=1)
 
     def _sort_by(self, db_col):
         if self._sort_col == db_col:
@@ -1050,8 +1270,12 @@ class BaseTab(ctk.CTkFrame):
         pass
 
     def _export_csv(self):
+        """Export respecting active filters."""
         q = self._search_var.get().strip()
-        rows = _fetch(self.TABLE_NAME, self.SEARCH_COLS, q)
+        rows = _fetch(self.TABLE_NAME, self.SEARCH_COLS, q,
+                      self._sort_col, self._sort_asc,
+                      month=self._filter_month, year=self._filter_year,
+                      dept_col=self.DEPT_FILTER_COL, dept_val=self._filter_dept)
         path = filedialog.asksaveasfilename(
             defaultextension=".csv",
             filetypes=[("CSV files", "*.csv")],
@@ -1065,18 +1289,25 @@ class BaseTab(ctk.CTkFrame):
                 writer.writerows(rows)
             messagebox.showinfo("Export Successful", f"Records exported to:\n{path}")
 
+    def _import_csv(self):
+        """Override in subclass to handle tab-specific column mapping."""
+        pass
+
     def _render_cells(self, frame, cells, open_detail_fn):
-        """Render fixed-width cells with click-to-detail binding."""
         for text, w, anch in cells:
             cell = ctk.CTkFrame(frame, fg_color="transparent", width=w, height=34)
-            cell.pack(side="left", padx=(4 if w == 42 else 2, 0))
+            cell.pack(side="left", padx=0)
             cell.pack_propagate(False)
             cell.bind("<Button-1>", open_detail_fn)
             cell.configure(cursor="hand2")
-            lbl = ctk.CTkLabel(cell, text=text, font=ctk.CTkFont(size=12),
-                               text_color=TEXT_MAIN, anchor=anch, cursor="hand2")
-            lbl.place(relx=0.05 if anch == "w" else 0.5,
-                      rely=0.5, anchor="w" if anch == "w" else "center")
+            if anch == "center":
+                lbl = ctk.CTkLabel(cell, text=text, font=ctk.CTkFont(size=12),
+                                   text_color=TEXT_MAIN, anchor="center", cursor="hand2")
+                lbl.place(relx=0.5, rely=0.5, anchor="center")
+            else:
+                lbl = ctk.CTkLabel(cell, text=text, font=ctk.CTkFont(size=12),
+                                   text_color=TEXT_MAIN, anchor="w", cursor="hand2")
+                lbl.place(x=8, rely=0.5, anchor="w")
             lbl.bind("<Button-1>", open_detail_fn)
         frame.bind("<Button-1>", open_detail_fn)
         frame.configure(cursor="hand2")
@@ -1084,22 +1315,22 @@ class BaseTab(ctk.CTkFrame):
 
 # ── Tab 1 — Incoming Memo ─────────────────────────────────────────────────────
 class MemoTab(BaseTab):
-    TABLE_NAME     = "memos"
-    SEARCH_COLS    = ["date", "department", "subject", "receiver"]
-    FORM_TITLE     = "New Incoming Memo"
-    FORM_HINT      = "Log a memo received from another department."
-    ACCENT         = TAB_COLORS["Incoming Memo"]["accent"]
-    DARK           = TAB_COLORS["Incoming Memo"]["dark"]
-    ICON           = "📥"
+    TABLE_NAME      = "memos"
+    SEARCH_COLS     = ["date", "department", "subject", "receiver"]
+    FORM_TITLE      = "New Incoming Memo"
+    FORM_HINT       = "Log a memo received from another department."
+    ACCENT          = TAB_COLORS["Incoming Memo"]["accent"]
+    DARK            = TAB_COLORS["Incoming Memo"]["dark"]
+    ICON            = "📥"
     PAST_POPUP_CLS  = PastMemoPopup
     DEPT_FILTER_COL = "department"
-    COL_SPECS      = [
-        ("#",           42,  "center"),
-        ("Date & Time", 148, "w"),
-        ("Department",  150, "w"),
-        ("Subject",     200, "w"),
-        ("Received By", 130, "w"),
-        ("Action",       60, "center"),
+    COL_SPECS       = [
+        ("#",           50,  "center"),
+        ("Date & Time", 150, "w"),
+        ("Department",  250, "w"),
+        ("Subject",     300, "w"),
+        ("Received By", 180, "w"),
+        ("Action",       80, "center"),
     ]
     SORT_MAP = {
         "Date & Time": "date",
@@ -1115,13 +1346,13 @@ class MemoTab(BaseTab):
 
         self._field_label(parent, "From Department")
         make_option(parent, self._dept_var, DEPARTMENTS,
-                    self.ACCENT, self.DARK).pack(anchor="w", padx=28, pady=(4, 10))
+                    self.ACCENT, self.DARK, width=290).pack(anchor="w", padx=20, pady=(2, 6))
         self._field_label(parent, "Subject / Memo Topic")
         make_entry(parent, self._subject_var,
-                   "e.g. Monthly Budget Report").pack(anchor="w", padx=28, pady=(4, 10))
+                   "e.g. Monthly Budget Report", width=290).pack(anchor="w", padx=20, pady=(2, 6))
         self._field_label(parent, "Received By")
         make_entry(parent, self._receiver_var,
-                   "e.g. Maria Santos").pack(anchor="w", padx=28, pady=(4, 14))
+                   "e.g. Maria Santos", width=290).pack(anchor="w", padx=20, pady=(2, 8))
 
     def _log_entry(self):
         dept = self._dept_var.get()
@@ -1145,12 +1376,77 @@ class MemoTab(BaseTab):
         _insert("memos", ["date","department","subject","receiver"],
                 (date_str, dept, subj, recv))
         self._refresh()
-        messagebox.showinfo("Logged",
-                            f"Past memo from '{dept}' ({date_str}) recorded.")
+        messagebox.showinfo("Logged", f"Past memo from '{dept}' ({date_str}) recorded.")
+
+    def _import_csv(self):
+        filetypes = [("Spreadsheet files", "*.csv *.xlsx"),
+                     ("CSV files", "*.csv"), ("Excel files", "*.xlsx")]
+        path = filedialog.askopenfilename(filetypes=filetypes,
+                                          title="Import Incoming Memo Records")
+        if not path:
+            return
+        headers, result = read_import_file(path)
+        if headers is None:
+            messagebox.showerror("Import Failed", result)
+            return
+        headers_lower = [h.lower() for h in headers]
+
+        def find_col(keywords):
+            for kw in keywords:
+                for orig, low in zip(headers, headers_lower):
+                    if kw in low:
+                        return orig
+            return None
+
+        col_date = find_col(["date", "time"])
+        col_dept = find_col(["dept", "department", "from"])
+        col_subj = find_col(["subject", "topic", "memo"])
+        col_recv = find_col(["received", "receiver", "by", "name"])
+
+        # Show what columns were detected — helps diagnose mismatches
+        if not all([col_date, col_dept, col_subj, col_recv]):
+            missing = []
+            if not col_date: missing.append("Date")
+            if not col_dept: missing.append("Department")
+            if not col_subj: missing.append("Subject")
+            if not col_recv: missing.append("Received By")
+            ans = messagebox.askyesno("Column Detection",
+                f"Could not auto-detect these columns: {', '.join(missing)}\n\n"
+                f"Columns found in file:\n{chr(10).join(headers)}\n\n"
+                f"Continue anyway? Rows with missing data will be skipped.")
+            if not ans:
+                return
+
+        imported = skipped = 0
+        for row in result:
+            date = (row.get(col_date, "") if col_date else "").strip()
+            dept = (row.get(col_dept, "") if col_dept else "").strip()
+            subj = (row.get(col_subj, "") if col_subj else "").strip()
+            recv = (row.get(col_recv, "") if col_recv else "").strip()
+            parsed_date = parse_date_flexible(date) if date else None
+            if not parsed_date:
+                parsed_date = date
+            # Skip only if the row is completely empty
+            if not any([parsed_date, dept, subj, recv]):
+                skipped += 1
+                continue
+            # Skip duplicates
+            if parsed_date and dept and subj and _exists(
+                    "memos", ["date","department","subject"],
+                    (parsed_date, dept, subj)):
+                skipped += 1
+                continue
+            _insert("memos", ["date","department","subject","receiver"],
+                    (parsed_date or "", dept, subj, recv))
+            imported += 1
+        self._refresh()
+        parts = [f"✔ {imported} record{'s' if imported!=1 else ''} imported."]
+        if skipped:
+            parts.append(f"⚠ {skipped} row(s) skipped (duplicates or missing fields).")
+        messagebox.showinfo("Import Complete", "\n".join(parts))
 
     def _open_edit(self, row):
-        EditMemoPopup(self, row,
-                      on_save=self._save_edit,
+        EditMemoPopup(self, row, on_save=self._save_edit,
                       on_delete=self._delete_record)
 
     def _save_edit(self, row_id, date, dept, subj, recv):
@@ -1168,33 +1464,33 @@ class MemoTab(BaseTab):
             RecordDetailPopup(self, fields, self.ACCENT)
 
         self._render_cells(frame, [
-            (str(memo_id), 42,  "center"),
-            (date,        148, "w"),
-            (dept,        150, "w"),
-            (subj,        200, "w"),
-            (recv,        130, "w"),
+            (str(memo_id),  50, "center"),
+            (date,         150, "w"),
+            (dept,         250, "w"),
+            (subj,         300, "w"),
+            (recv,         180, "w"),
         ], open_detail)
         self._add_edit_btn(frame, row, self.ACCENT)
 
 
 # ── Tab 2 — Outgoing Memo ─────────────────────────────────────────────────────
 class OutgoingTab(BaseTab):
-    TABLE_NAME     = "outgoing"
-    SEARCH_COLS    = ["date","subject","recipient"]
-    FORM_TITLE     = "New Outgoing Memo"
-    FORM_HINT      = "Record a memo sent out from your office."
-    ACCENT         = TAB_COLORS["Outgoing Memo"]["accent"]
-    DARK           = TAB_COLORS["Outgoing Memo"]["dark"]
-    ICON           = "📤"
+    TABLE_NAME      = "outgoing"
+    SEARCH_COLS     = ["date", "subject", "recipient"]
+    FORM_TITLE      = "New Outgoing Memo"
+    FORM_HINT       = "Record a memo sent out from your office."
+    ACCENT          = TAB_COLORS["Outgoing Memo"]["accent"]
+    DARK            = TAB_COLORS["Outgoing Memo"]["dark"]
+    ICON            = "📤"
     PAST_POPUP_CLS  = PastOutgoingPopup
     DEPT_FILTER_COL = "recipient"
-    COL_SPECS      = [
-        ("#",             42,  "center"),
-        ("Date",         110, "w"),
-        ("Subject",      200, "w"),
-        ("Sent To Dept.", 200, "w"),
-        ("Remarks",      150, "w"),
-        ("Action",        60, "center"),
+    COL_SPECS       = [
+        ("#",             50, "center"),
+        ("Date",         130, "w"),
+        ("Subject",      300, "w"),
+        ("Sent To Dept.", 300, "w"),
+        ("Remarks",      200, "w"),
+        ("Action",        80, "center"),
     ]
     SORT_MAP = {
         "Date":          "date",
@@ -1209,13 +1505,13 @@ class OutgoingTab(BaseTab):
 
         self._field_label(parent, "Subject / Title")
         make_entry(parent, self._subject_var,
-                   "e.g. Q2 Report").pack(anchor="w", padx=28, pady=(4, 10))
+                   "e.g. Q2 Report", width=290).pack(anchor="w", padx=20, pady=(2, 6))
         self._field_label(parent, "Department Sent To")
         make_option(parent, self._recipient_var, DEPARTMENTS,
-                    self.ACCENT, self.DARK).pack(anchor="w", padx=28, pady=(4, 10))
+                    self.ACCENT, self.DARK, width=290).pack(anchor="w", padx=20, pady=(2, 6))
         self._field_label(parent, "Remarks (optional)")
         make_entry(parent, self._remarks_var,
-                   "e.g. Via courier").pack(anchor="w", padx=28, pady=(4, 14))
+                   "e.g. Via courier", width=290).pack(anchor="w", padx=20, pady=(2, 8))
 
     def _log_entry(self):
         subj    = self._subject_var.get().strip()
@@ -1237,12 +1533,75 @@ class OutgoingTab(BaseTab):
         _insert("outgoing", ["date","subject","recipient","remarks"],
                 (date_str, subj, recip, remarks))
         self._refresh()
-        messagebox.showinfo("Logged",
-                            f"Past outgoing memo ({date_str}) recorded.")
+        messagebox.showinfo("Logged", f"Past outgoing memo ({date_str}) recorded.")
+
+    def _import_csv(self):
+        filetypes = [("Spreadsheet files", "*.csv *.xlsx"),
+                     ("CSV files", "*.csv"), ("Excel files", "*.xlsx")]
+        path = filedialog.askopenfilename(filetypes=filetypes,
+                                          title="Import Outgoing Memo Records")
+        if not path:
+            return
+        headers, result = read_import_file(path)
+        if headers is None:
+            messagebox.showerror("Import Failed", result)
+            return
+        headers_lower = [h.lower() for h in headers]
+
+        def find_col(keywords):
+            for kw in keywords:
+                for orig, low in zip(headers, headers_lower):
+                    if kw in low:
+                        return orig
+            return None
+
+        col_date    = find_col(["date", "time"])
+        col_subj    = find_col(["subject", "topic", "memo"])
+        col_recip   = find_col(["sent", "recipient", "dept", "department", "to"])
+        col_remarks = find_col(["remark", "note", "comment"])
+
+        if not all([col_date, col_subj, col_recip]):
+            missing = []
+            if not col_date:  missing.append("Date")
+            if not col_subj:  missing.append("Subject")
+            if not col_recip: missing.append("Department Sent To")
+            ans = messagebox.askyesno("Column Detection",
+                f"Could not auto-detect these columns: {', '.join(missing)}\n\n"
+                f"Columns found in file:\n{chr(10).join(headers)}\n\n"
+                f"Continue anyway? Rows with missing data will be skipped.")
+            if not ans:
+                return
+
+        imported = skipped = 0
+        for row in result:
+            date    = (row.get(col_date,    "") if col_date    else "").strip()
+            subj    = (row.get(col_subj,    "") if col_subj    else "").strip()
+            recip   = (row.get(col_recip,   "") if col_recip   else "").strip()
+            remarks = (row.get(col_remarks, "") if col_remarks else "").strip()
+            parsed_date = parse_date_flexible(date) if date else None
+            if not parsed_date:
+                parsed_date = date
+            # Skip only if the row is completely empty
+            if not any([parsed_date, subj, recip]):
+                skipped += 1
+                continue
+            # Skip duplicates
+            if parsed_date and subj and recip and _exists(
+                    "outgoing", ["date","subject","recipient"],
+                    (parsed_date, subj, recip)):
+                skipped += 1
+                continue
+            _insert("outgoing", ["date","subject","recipient","remarks"],
+                    (parsed_date or "", subj, recip, remarks))
+            imported += 1
+        self._refresh()
+        parts = [f"✔ {imported} record{'s' if imported!=1 else ''} imported."]
+        if skipped:
+            parts.append(f"⚠ {skipped} row(s) skipped (duplicates or missing fields).")
+        messagebox.showinfo("Import Complete", "\n".join(parts))
 
     def _open_edit(self, row):
-        EditOutgoingPopup(self, row,
-                          on_save=self._save_edit,
+        EditOutgoingPopup(self, row, on_save=self._save_edit,
                           on_delete=self._delete_record)
 
     def _save_edit(self, row_id, date, subj, recip, remarks):
@@ -1260,14 +1619,188 @@ class OutgoingTab(BaseTab):
             RecordDetailPopup(self, fields, self.ACCENT)
 
         self._render_cells(frame, [
-            (str(rid),  42,  "center"),
-            (date,     110, "w"),
-            (subj,     200, "w"),
-            (recip,    200, "w"),
-            (remarks,  150, "w"),
+            (str(rid),      50, "center"),
+            (date,         130, "w"),
+            (subj,         300, "w"),
+            (recip,        300, "w"),
+            (remarks or "", 200, "w"),
         ], open_detail)
         self._add_edit_btn(frame, row, self.ACCENT)
 
+
+
+# ── Tab 3 — Endorsements ─────────────────────────────────────────────────────
+class EndorsementTab(BaseTab):
+    TABLE_NAME      = "endorsements"
+    SEARCH_COLS     = ["date", "name", "subject", "endorsed_to"]
+    FORM_TITLE      = "New Endorsement"
+    FORM_HINT       = "Log an endorsement letter."
+    ACCENT          = TAB_COLORS["Endorsements"]["accent"]
+    DARK            = TAB_COLORS["Endorsements"]["dark"]
+    ICON            = "📋"
+    PAST_POPUP_CLS  = PastEndorsementPopup
+    PAST_LABEL      = "Endorsement"
+    DEPT_FILTER_COL = None
+    COMPACT         = True
+    COL_SPECS       = [
+        ("#",            50, "center"),
+        ("Date",        120, "w"),
+        ("Name",        180, "w"),
+        ("Subject",     220, "w"),
+        ("Endorsed To", 160, "w"),
+        ("Office",      160, "w"),
+        ("Remarks",     110, "w"),
+        ("Action",       80, "center"),
+    ]
+    SORT_MAP = {
+        "Date":        "date",
+        "Name":        "name",
+        "Subject":     "subject",
+        "Endorsed To": "endorsed_to",
+        "Office":      "office",
+    }
+
+    def _build_fields(self, parent):
+        self._name_var        = ctk.StringVar()
+        self._subject_var     = ctk.StringVar()
+        self._endorsed_to_var = ctk.StringVar()
+        self._office_var      = ctk.StringVar()
+        self._remarks_var     = ctk.StringVar()
+
+        for label, var, placeholder in [
+            ("Name (Who is Endorsed)", self._name_var,        "e.g. Juan dela Cruz"),
+            ("Subject",                self._subject_var,     "e.g. Employment Endorsement"),
+            ("Endorsed To",            self._endorsed_to_var, "e.g. City Mayor"),
+            ("Office",                 self._office_var,      "e.g. Office of the City Mayor"),
+            ("Remarks (optional)",     self._remarks_var,     "e.g. For signature"),
+        ]:
+            make_label(parent, label, size=11, weight="bold",
+                       color=TEXT_SUB).pack(anchor="w", padx=20, pady=(3, 0))
+            ctk.CTkEntry(parent, textvariable=var, placeholder_text=placeholder,
+                         fg_color=CARD, border_color=BORDER, text_color=TEXT_MAIN,
+                         font=ctk.CTkFont(size=12), width=290, height=30,
+                         ).pack(anchor="w", padx=20, pady=(2, 0))
+
+    def _log_entry(self):
+        name        = self._name_var.get().strip()
+        subj        = self._subject_var.get().strip()
+        endorsed_to = self._endorsed_to_var.get().strip()
+        office      = self._office_var.get().strip()
+        remarks     = self._remarks_var.get().strip()
+        if not name:
+            return messagebox.showwarning("Missing", "Please enter the name.")
+        if not subj:
+            return messagebox.showwarning("Missing", "Please enter the subject.")
+        if not endorsed_to:
+            return messagebox.showwarning("Missing", "Please enter who it is endorsed to.")
+        _insert("endorsements",
+                ["date","name","subject","endorsed_to","office","remarks"],
+                (now_str(), name, subj, endorsed_to, office, remarks))
+        self._name_var.set("")
+        self._subject_var.set("")
+        self._endorsed_to_var.set("")
+        self._office_var.set("")
+        self._remarks_var.set("")
+        self._refresh()
+        messagebox.showinfo("Logged", f"Endorsement for '{name}' has been recorded.")
+
+    def _save_past_entry(self, date_str, name, subj, endorsed_to, office, remarks):
+        _insert("endorsements",
+                ["date","name","subject","endorsed_to","office","remarks"],
+                (date_str, name, subj, endorsed_to, office, remarks))
+        self._refresh()
+        messagebox.showinfo("Logged",
+                            f"Past endorsement for '{name}' ({date_str}) recorded.")
+
+    def _open_edit(self, row):
+        EditEndorsementPopup(self, row,
+                             on_save=self._save_edit,
+                             on_delete=self._delete_record)
+
+    def _save_edit(self, row_id, date, name, subj, endorsed_to, office, remarks):
+        _update("endorsements",
+                ["date","name","subject","endorsed_to","office","remarks"],
+                (date, name, subj, endorsed_to, office, remarks), row_id)
+        self._refresh()
+        messagebox.showinfo("Saved", f"Endorsement #{row_id} updated.")
+
+    def _import_csv(self):
+        filetypes = [("Spreadsheet files", "*.csv *.xlsx"),
+                     ("CSV files", "*.csv"), ("Excel files", "*.xlsx")]
+        path = filedialog.askopenfilename(filetypes=filetypes,
+                                          title="Import Endorsement Records")
+        if not path:
+            return
+        headers, result = read_import_file(path)
+        if headers is None:
+            messagebox.showerror("Import Failed", result)
+            return
+        headers_lower = [h.lower() for h in headers]
+
+        def find_col(keywords):
+            for kw in keywords:
+                for orig, low in zip(headers, headers_lower):
+                    if kw in low:
+                        return orig
+            return None
+
+        col_date = find_col(["date"])
+        col_name = find_col(["name", "endorsed", "who"])
+        col_subj = find_col(["subject", "topic"])
+        col_to   = find_col(["to", "addressee", "endorsed to"])
+        col_rem  = find_col(["remark", "note", "comment"])
+
+        imported = skipped = 0
+        for row in result:
+            date        = (row.get(col_date, "") if col_date else "").strip()
+            name        = (row.get(col_name, "") if col_name else "").strip()
+            subj        = (row.get(col_subj, "") if col_subj else "").strip()
+            endorsed_to = (row.get(col_to,   "") if col_to   else "").strip()
+            remarks     = (row.get(col_rem,  "") if col_rem  else "").strip()
+            parsed_date = parse_date_flexible(date) if date else None
+            if not parsed_date:
+                parsed_date = date
+            if not any([parsed_date, name, subj, endorsed_to]):
+                skipped += 1
+                continue
+            if parsed_date and name and subj and _exists(
+                    "endorsements", ["date","name","subject"],
+                    (parsed_date, name, subj)):
+                skipped += 1
+                continue
+            _insert("endorsements",
+                    ["date","name","subject","endorsed_to","remarks"],
+                    (parsed_date or "", name, subj, endorsed_to, remarks))
+            imported += 1
+        self._refresh()
+        parts = [f"✔ {imported} record{'s' if imported!=1 else ''} imported."]
+        if skipped:
+            parts.append(f"⚠ {skipped} row(s) skipped (duplicates or empty rows).")
+        messagebox.showinfo("Import Complete", "\n".join(parts))
+
+    def _render_row(self, frame, row):
+        if len(row) == 7:
+            rid, date, name, subj, endorsed_to, office, remarks = row
+        else:
+            rid, date, name, subj, endorsed_to, remarks = row
+            office = ""
+        fields = [("Date", date), ("Name", name), ("Subject", subj),
+                  ("Endorsed To", endorsed_to), ("Office", office),
+                  ("Remarks", remarks)]
+
+        def open_detail(e=None):
+            RecordDetailPopup(self, fields, self.ACCENT)
+
+        self._render_cells(frame, [
+            (str(rid),       50, "center"),
+            (date,          120, "w"),
+            (name,          180, "w"),
+            (subj,          220, "w"),
+            (endorsed_to,   160, "w"),
+            (office or "",  160, "w"),
+            (remarks or "", 110, "w"),
+        ], open_detail)
+        self._add_edit_btn(frame, row, self.ACCENT)
 
 # ── Tab 3 — Department Editor ─────────────────────────────────────────────────
 class DepartmentsTab(ctk.CTkFrame):
@@ -1289,7 +1822,6 @@ class DepartmentsTab(ctk.CTkFrame):
                              width=310, border_width=0)
         panel.grid(row=0, column=0, sticky="nsew")
         panel.pack_propagate(False)
-
         ctk.CTkFrame(panel, fg_color=self.ACCENT,
                      corner_radius=0, height=6).pack(fill="x")
         make_label(panel, "Department Editor", size=16, weight="bold",
@@ -1297,34 +1829,26 @@ class DepartmentsTab(ctk.CTkFrame):
         make_label(panel, "Add or remove departments from the list.",
                    size=11, weight="normal", color=TEXT_SUB
                    ).pack(anchor="w", padx=28, pady=(0, 20))
-
         make_label(panel, "New Department Name", size=11, weight="bold",
                    color=TEXT_SUB).pack(anchor="w", padx=28)
         self._new_dept_var = ctk.StringVar()
         make_entry(panel, self._new_dept_var,
                    "e.g. City Health Office").pack(anchor="w", padx=28, pady=(4, 14))
-
         make_button(panel, "  ＋  Add Department", self._add_dept,
-                    self.ACCENT, self.DARK, height=42
-                    ).pack(anchor="w", padx=28)
+                    self.ACCENT, self.DARK, height=42).pack(anchor="w", padx=28)
 
     def _build_list(self):
         panel = ctk.CTkFrame(self, fg_color=SURFACE, corner_radius=0)
         panel.grid(row=0, column=1, sticky="nsew")
-
         top = ctk.CTkFrame(panel, fg_color=SURFACE, corner_radius=0)
         top.pack(fill="x", padx=24, pady=(18, 0))
         make_label(top, "Current Departments", size=16, weight="bold",
                    color=self.ACCENT).pack(side="left")
-        self._count_lbl = make_label(top, "", size=11, weight="normal",
-                                     color=TEXT_SUB)
+        self._count_lbl = make_label(top, "", size=11, weight="normal", color=TEXT_SUB)
         self._count_lbl.pack(side="left", padx=10)
-
         tcard = ctk.CTkFrame(panel, fg_color=CARD, corner_radius=10,
                              border_width=1, border_color=BORDER)
         tcard.pack(fill="both", expand=True, padx=24, pady=12)
-
-        # Header
         hdr = ctk.CTkFrame(tcard, fg_color=self.ACCENT, corner_radius=0, height=38)
         hdr.pack(fill="x")
         hdr.pack_propagate(False)
@@ -1338,10 +1862,8 @@ class DepartmentsTab(ctk.CTkFrame):
                          text_color="#FFFFFF", anchor=anch,
                          ).place(relx=0.05 if anch == "w" else 0.5,
                                  rely=0.5, anchor="w" if anch == "w" else "center")
-
         self._rows_frame = ctk.CTkScrollableFrame(
-            tcard, fg_color=CARD, corner_radius=0,
-            scrollbar_button_color=BORDER)
+            tcard, fg_color=CARD, corner_radius=0, scrollbar_button_color=BORDER)
         self._rows_frame.pack(fill="both", expand=True)
 
     def _refresh(self):
@@ -1350,39 +1872,28 @@ class DepartmentsTab(ctk.CTkFrame):
         rows = fetch_department_rows()
         n = len(rows)
         self._count_lbl.configure(text=f"({n} department{'s' if n != 1 else ''})")
-
         if not rows:
             make_label(self._rows_frame, "No departments added yet.",
                        size=13, weight="normal", color=TEXT_SUB).pack(pady=40)
             return
-
         for idx, (dept_id, name) in enumerate(rows):
             bg = CARD if idx % 2 == 0 else ROW_ALT
             rf = ctk.CTkFrame(self._rows_frame, fg_color=bg,
                               corner_radius=0, height=38)
             rf.pack(fill="x")
             rf.pack_propagate(False)
-
-            # ID cell
             id_cell = ctk.CTkFrame(rf, fg_color="transparent", width=42, height=36)
             id_cell.pack(side="left", padx=(4, 2))
             id_cell.pack_propagate(False)
             ctk.CTkLabel(id_cell, text=str(dept_id), font=ctk.CTkFont(size=12),
                          text_color=TEXT_MAIN, anchor="center"
                          ).place(relx=0.5, rely=0.5, anchor="center")
-
-            # Name cell — editable inline
             name_var = ctk.StringVar(value=name)
             name_entry = ctk.CTkEntry(rf, textvariable=name_var,
-                                      fg_color="transparent",
-                                      border_color=BORDER,
-                                      border_width=0,
-                                      text_color=TEXT_MAIN,
-                                      font=ctk.CTkFont(size=12),
-                                      width=480, height=30)
+                                      fg_color="transparent", border_color=BORDER,
+                                      border_width=0, text_color=TEXT_MAIN,
+                                      font=ctk.CTkFont(size=12), width=480, height=30)
             name_entry.pack(side="left", padx=(2, 4))
-
-            # On focus, show border; on focus-out, save if changed
             name_entry.bind("<FocusIn>",
                             lambda e, w=name_entry: w.configure(border_width=1))
             name_entry.bind("<FocusOut>",
@@ -1391,8 +1902,6 @@ class DepartmentsTab(ctk.CTkFrame):
             name_entry.bind("<Return>",
                             lambda e, did=dept_id, var=name_var, orig=name:
                             self._inline_save(did, var.get().strip(), orig))
-
-            # Delete button
             ctk.CTkButton(rf, text="🗑", width=36, height=26,
                           fg_color="#FADBD8", hover_color="#F1948A",
                           text_color=DANGER,
@@ -1405,8 +1914,7 @@ class DepartmentsTab(ctk.CTkFrame):
         if new_name == original or not new_name:
             return
         if not update_department(dept_id, new_name):
-            messagebox.showwarning("Duplicate",
-                                   f"'{new_name}' already exists.")
+            messagebox.showwarning("Duplicate", f"'{new_name}' already exists.")
         else:
             load_departments()
             self._on_changed()
@@ -1417,8 +1925,7 @@ class DepartmentsTab(ctk.CTkFrame):
         if not name:
             return messagebox.showwarning("Missing", "Please enter a department name.")
         if not insert_department(name):
-            return messagebox.showwarning("Duplicate",
-                                          f"'{name}' already exists.")
+            return messagebox.showwarning("Duplicate", f"'{name}' already exists.")
         self._new_dept_var.set("")
         load_departments()
         self._on_changed()
@@ -1434,19 +1941,45 @@ class DepartmentsTab(ctk.CTkFrame):
             self._refresh()
 
 
+# ── Summary Dashboard ─────────────────────────────────────────────────────────
+class SummaryBar(ctk.CTkFrame):
+    """Small dashboard strip shown at the top of the content area."""
+    def __init__(self, parent):
+        super().__init__(parent, fg_color=CARD, corner_radius=0,
+                         border_width=0, height=54)
+        self.pack_propagate(False)
+        self._build()
+        self._update()
+
+    def _build(self):
+        month_lbl = make_label(self, f"This Month ({datetime.now().strftime('%B %Y')}):",
+                               size=11, weight="bold", color=TEXT_SUB)
+        month_lbl.pack(side="left", padx=(20, 10))
+
+        self._inc_lbl = ctk.CTkLabel(self, text="",
+                                     font=ctk.CTkFont(size=13, weight="bold"),
+                                     text_color=TAB_COLORS["Incoming Memo"]["accent"])
+        self._inc_lbl.pack(side="left", padx=(0, 16))
+
+        self._out_lbl = ctk.CTkLabel(self, text="",
+                                     font=ctk.CTkFont(size=13, weight="bold"),
+                                     text_color=TAB_COLORS["Outgoing Memo"]["accent"])
+        self._out_lbl.pack(side="left")
+
+    def _update(self):
+        inc, out = get_monthly_summary()
+        self._inc_lbl.configure(text=f"📥 Incoming: {inc}")
+        self._out_lbl.configure(text=f"📤 Outgoing: {out}")
+        self.after(30000, self._update)  # refresh every 30 seconds
+
+
 # ── Main App Window ───────────────────────────────────────────────────────────
 class DocTrackerApp(ctk.CTk):
-    TABS = [
-        ("Incoming Memo", None),
-        ("Outgoing Memo", None),
-        ("Departments",   None),
-    ]
-
     def __init__(self):
         super().__init__()
         self.title("Office Memo Tracker")
-        self.geometry("1140x700")
-        self.minsize(960, 600)
+        self.geometry("1440x780")
+        self.minsize(1200, 650)
         self.configure(fg_color=SURFACE)
         init_db()
         load_departments()
@@ -1462,6 +1995,7 @@ class DocTrackerApp(ctk.CTk):
             self.destroy()
 
     def _build_ui(self):
+        # Header
         hdr = ctk.CTkFrame(self, fg_color=ACCENT, corner_radius=0, height=62)
         hdr.pack(fill="x", side="top")
         hdr.pack_propagate(False)
@@ -1470,17 +2004,15 @@ class DocTrackerApp(ctk.CTk):
                      text_color="#FFFFFF", anchor="w",
                      ).pack(side="left", padx=24)
         self._clock = ctk.CTkLabel(hdr, text="",
-                                   font=ctk.CTkFont(size=13),
-                                   text_color="#A9CCE3")
+                                   font=ctk.CTkFont(size=13), text_color="#A9CCE3")
         self._clock.pack(side="right", padx=24)
         self._tick()
 
+        # Tab bar
         tab_bar = ctk.CTkFrame(self, fg_color="#D6E4F0", corner_radius=0, height=46)
         tab_bar.pack(fill="x")
         tab_bar.pack_propagate(False)
-
-        tab_names = ["Incoming Memo", "Outgoing Memo", "Departments"]
-        for name in tab_names:
+        for name in ["Incoming Memo", "Outgoing Memo", "Endorsements", "Departments"]:
             info = TAB_COLORS[name]
             btn = ctk.CTkButton(
                 tab_bar, text=f"  {info['icon']}  {name}",
@@ -1493,6 +2025,12 @@ class DocTrackerApp(ctk.CTk):
             btn.pack(side="left")
             self._tab_widgets[name] = btn
 
+        # Summary bar
+        self._summary_bar = SummaryBar(self)
+        self._summary_bar.pack(fill="x")
+        ctk.CTkFrame(self, fg_color=BORDER, height=1).pack(fill="x")
+
+        # Content area
         content = ctk.CTkFrame(self, fg_color=SURFACE, corner_radius=0)
         content.pack(fill="both", expand=True)
         content.columnconfigure(0, weight=1)
@@ -1500,48 +2038,45 @@ class DocTrackerApp(ctk.CTk):
 
         memo_panel    = MemoTab(content)
         out_panel     = OutgoingTab(content)
+        endorse_panel = EndorsementTab(content)
         dept_panel    = DepartmentsTab(content,
-                                       on_departments_changed=self._on_depts_changed)
+                                    on_departments_changed=self._on_depts_changed)
 
         memo_panel.grid(row=0, column=0, sticky="nsew")
         out_panel.grid(row=0, column=0, sticky="nsew")
+        endorse_panel.grid(row=0, column=0, sticky="nsew")
         dept_panel.grid(row=0, column=0, sticky="nsew")
 
         self._tab_panels["Incoming Memo"] = memo_panel
         self._tab_panels["Outgoing Memo"] = out_panel
+        self._tab_panels["Endorsements"]  = endorse_panel
         self._tab_panels["Departments"]   = dept_panel
 
     def _on_depts_changed(self):
-        """Update department dropdowns in both tabs without rebuilding the form."""
         for tab_name in ("Incoming Memo", "Outgoing Memo"):
             panel = self._tab_panels[tab_name]
-            # Walk all CTkOptionMenu widgets in the form panel and refresh values
             self._update_option_menus(panel._form_panel)
-
-    def _update_option_menus(self, parent):
-        """Recursively update all CTkOptionMenu values to latest DEPARTMENTS."""
-        for widget in parent.winfo_children():
-            if isinstance(widget, ctk.CTkOptionMenu):
-                current = widget.get()
-                widget.configure(values=DEPARTMENTS)
-                if current in DEPARTMENTS:
-                    widget.set(current)
-                else:
-                    widget.set(DEPARTMENTS[0])
-            else:
-                try:
-                    self._update_option_menus(widget)
-                except Exception:
-                    pass
-        # Also refresh dept filter dropdowns on each tab
         for tab_name in ("Incoming Memo", "Outgoing Memo"):
             panel = self._tab_panels[tab_name]
-            if hasattr(panel, "_dept_filter_menu"):
+            if hasattr(panel, "_dept_filter_menu") and panel._dept_filter_menu:
                 current = panel._dept_filter_var.get()
                 new_vals = ["All Departments"] + DEPARTMENTS[1:]
                 panel._dept_filter_menu.configure(values=new_vals)
                 if current not in new_vals:
                     panel._dept_filter_var.set("All Departments")
+                    panel._filter_dept = "All Departments"
+
+    def _update_option_menus(self, parent):
+        for widget in parent.winfo_children():
+            if isinstance(widget, ctk.CTkOptionMenu):
+                current = widget.get()
+                widget.configure(values=DEPARTMENTS)
+                widget.set(current if current in DEPARTMENTS else DEPARTMENTS[0])
+            else:
+                try:
+                    self._update_option_menus(widget)
+                except Exception:
+                    pass
 
     def _switch_tab(self, name):
         if self._active_tab == name:
@@ -1550,14 +2085,14 @@ class DocTrackerApp(ctk.CTk):
         info = TAB_COLORS[name]
         for tab_name, btn in self._tab_widgets.items():
             if tab_name == name:
-                btn.configure(fg_color=info["accent"],
-                              hover_color=info["dark"],
+                btn.configure(fg_color=info["accent"], hover_color=info["dark"],
                               text_color="#FFFFFF")
             else:
-                btn.configure(fg_color=TAB_IDLE_BG,
-                              hover_color=TAB_IDLE_BG,
+                btn.configure(fg_color=TAB_IDLE_BG, hover_color=TAB_IDLE_BG,
                               text_color=TAB_IDLE_TEXT)
         self._tab_panels[name].tkraise()
+        # Refresh summary whenever switching tabs
+        self._summary_bar._update()
 
     def _tick(self):
         self._clock.configure(
@@ -1565,7 +2100,6 @@ class DocTrackerApp(ctk.CTk):
         self.after(1000, self._tick)
 
 
-# ── Entry point ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     app = DocTrackerApp()
     app.mainloop()

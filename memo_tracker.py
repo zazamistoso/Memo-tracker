@@ -941,6 +941,7 @@ class BaseTab(ctk.CTkFrame):
     DEPT_FILTER_COL = None
     PAST_LABEL      = "Memo"
     COMPACT         = False  # set True on tabs with many fields
+    EXPORT_HEADERS  = []     # override in subclass
 
     def __init__(self, parent):
         super().__init__(parent, fg_color=SURFACE, corner_radius=0)
@@ -1270,7 +1271,7 @@ class BaseTab(ctk.CTkFrame):
         pass
 
     def _export_csv(self):
-        """Export respecting active filters."""
+        """Export respecting active filters. Uses EXPORT_HEADERS for clean column names."""
         q = self._search_var.get().strip()
         rows = _fetch(self.TABLE_NAME, self.SEARCH_COLS, q,
                       self._sort_col, self._sort_asc,
@@ -1283,10 +1284,12 @@ class BaseTab(ctk.CTkFrame):
             title="Save CSV Export",
         )
         if path:
-            with open(path, "w", newline="", encoding="utf-8") as f:
+            with open(path, "w", newline="", encoding="utf-8-sig") as f:
                 writer = csv.writer(f)
-                writer.writerow([c[0] for c in self.COL_SPECS])
-                writer.writerows(rows)
+                writer.writerow(self.EXPORT_HEADERS)
+                for row in rows:
+                    # Skip the id column (index 0), write the rest
+                    writer.writerow(row[1:])
             messagebox.showinfo("Export Successful", f"Records exported to:\n{path}")
 
     def _import_csv(self):
@@ -1338,6 +1341,7 @@ class MemoTab(BaseTab):
         "Subject":     "subject",
         "Received By": "receiver",
     }
+    EXPORT_HEADERS = ["Date & Time", "Department", "Subject", "Received By"]
 
     def _build_fields(self, parent):
         self._dept_var     = ctk.StringVar(value=DEPARTMENTS[0] if DEPARTMENTS else "")
@@ -1497,6 +1501,7 @@ class OutgoingTab(BaseTab):
         "Subject":       "subject",
         "Sent To Dept.": "recipient",
     }
+    EXPORT_HEADERS = ["Date", "Subject", "Sent To Dept.", "Remarks"]
 
     def _build_fields(self, parent):
         self._subject_var   = ctk.StringVar()
@@ -1659,6 +1664,7 @@ class EndorsementTab(BaseTab):
         "Endorsed To": "endorsed_to",
         "Office":      "office",
     }
+    EXPORT_HEADERS = ["Date", "Name", "Subject", "Endorsed To", "Office", "Remarks"]
 
     def _build_fields(self, parent):
         self._name_var        = ctk.StringVar()
@@ -1747,7 +1753,8 @@ class EndorsementTab(BaseTab):
         col_date = find_col(["date"])
         col_name = find_col(["name", "endorsed", "who"])
         col_subj = find_col(["subject", "topic"])
-        col_to   = find_col(["to", "addressee", "endorsed to"])
+        col_to   = find_col(["endorsed to", "to", "addressee"])
+        col_off  = find_col(["office"])
         col_rem  = find_col(["remark", "note", "comment"])
 
         imported = skipped = 0
@@ -1756,6 +1763,7 @@ class EndorsementTab(BaseTab):
             name        = (row.get(col_name, "") if col_name else "").strip()
             subj        = (row.get(col_subj, "") if col_subj else "").strip()
             endorsed_to = (row.get(col_to,   "") if col_to   else "").strip()
+            office      = (row.get(col_off,  "") if col_off  else "").strip()
             remarks     = (row.get(col_rem,  "") if col_rem  else "").strip()
             parsed_date = parse_date_flexible(date) if date else None
             if not parsed_date:
@@ -1769,8 +1777,8 @@ class EndorsementTab(BaseTab):
                 skipped += 1
                 continue
             _insert("endorsements",
-                    ["date","name","subject","endorsed_to","remarks"],
-                    (parsed_date or "", name, subj, endorsed_to, remarks))
+                    ["date","name","subject","endorsed_to","office","remarks"],
+                    (parsed_date or "", name, subj, endorsed_to, office, remarks))
             imported += 1
         self._refresh()
         parts = [f"✔ {imported} record{'s' if imported!=1 else ''} imported."]

@@ -17,6 +17,13 @@ ctk.set_default_color_theme("blue")
 
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "doc_tracker.db")
 
+# ── DB Folder Setup ───────────────────────────────────────────────────────────
+# Save database in Documents/OfficeMemoTracker/ so it persists safely
+# regardless of where the .exe is placed
+_DB_FOLDER = os.path.join(os.path.expanduser("~"), "Documents", "OfficeMemoTracker")
+os.makedirs(_DB_FOLDER, exist_ok=True)
+DB_PATH = os.path.join(_DB_FOLDER, "doc_tracker.db")
+
 ACCENT      = "#1B4F72"
 ACCENT_DARK = "#154360"
 SURFACE     = "#F4F6F8"
